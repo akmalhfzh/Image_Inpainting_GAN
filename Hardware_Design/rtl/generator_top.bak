@@ -1,0 +1,410 @@
+// =============================================================================
+// generator_top.v — FIXED VERSION
+// =============================================================================
+// [FIX-1] BN module di-bypass sepenuhnya (cur_has_bn selalu 0).
+//         Activation langsung di-drive dari conv_rd_trunc.
+//         Ini konsisten dengan extract_weights.py yang sudah full-fold BN.
+//
+// [FIX-2] ST_ACT_FLUSH: tunggu pipeline drain dengan counter eksplisit,
+//         bukan cek fmap_wr_ptr saja. Activation pipeline:
+//           leaky_relu / relu  = 0 cycle latency (combinational)
+//           tanh_act           = 1 cycle latency
+//         Jadi perlu flush 1 extra cycle untuk tanh, 0 untuk yang lain.
+//
+// [FIX-3] BOT layer (layer 5): cur_act=2'd3 artinya "no activation / bypass".
+//         Pastikan act_sel tidak salah pilih activation.
+//
+// [FIX-4] Sederhanakan pengiriman data ke activation: tidak lagi lewat BN,
+//         langsung act_valid_in dan act_x_in dari readback loop.
+//
+// [FIX-5] pixels_per_ch dihitung dari register (bukan wire dari cfg) agar
+//         stabil selama readback dan tidak glitch saat set_layer_info dipanggil.
+// =============================================================================
+`timescale 1ns/1ps
+`default_nettype none
+
+module generator_top #(
+    parameter DW     = 16,
+    parameter FRAC_W = 8,
+    parameter ACC_W  = 48
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,
+    output reg  done,
+
+    input  wire                 img_wr_en,
+    input  wire [13:0]          img_wr_addr,
+    input  wire signed [DW-1:0] img_wr_data,
+
+    input  wire                 wr_en,
+    input  wire [3:0]           wr_layer,
+    input  wire [1:0]           wr_type,
+    input  wire [17:0]          wr_addr,
+    input  wire signed [DW-1:0] wr_data,
+
+    input  wire [13:0]          out_rd_addr,
+    output wire signed [DW-1:0] out_rd_data
+);
+    localparam IMG_SZ  = 3  * 64 * 64;
+    localparam OUT_SZ  = 3  * 64 * 64;
+    
+    // [FIX] FMAP_SZ dikecilkan sesuai max layer size (D5 output) agar muat di FPGA!
+    localparam FMAP_SZ = 32 * 64 * 64; // 131072
+
+    localparam signed [DW-1:0] SAT_MAX = 16'sh7FFF;
+    localparam signed [DW-1:0] SAT_MIN = 16'sh8000;
+
+    // [FIX] Pindahkan deklarasi state, layer_idx, dan FSM counter ke sini (DI ATAS always block)
+    localparam ST_IDLE       = 4'd0;
+    localparam ST_LOAD_INPUT = 4'd1;
+    localparam ST_CONV_START = 4'd2;
+    localparam ST_CONV_WAIT  = 4'd3;
+    localparam ST_READBACK   = 4'd4;
+    localparam ST_ACT_FLUSH  = 4'd5;
+    localparam ST_NEXT_LAYER = 4'd6;
+    localparam ST_DONE       = 4'd7;
+
+    reg [3:0]  state, layer_idx;
+    reg [17:0] rb_cnt;
+    reg [17:0] rb_total;
+    reg [17:0] fmap_wr_ptr;
+    
+    reg [11:0] cur_c_out;
+    reg [9:0]  cur_h_out, cur_w_out;
+    reg [1:0]  cur_act;         // 0=lrelu,1=relu,2=tanh,3=bypass
+    reg [17:0] cur_ifmap_sz;
+    reg [17:0] pixels_per_ch_r; 
+    
+    // [FIX] Pragma sintesis Vivado agar dipetakan menjadi BRAM, bukan Flip-Flop!
+    (* ram_style = "block" *) reg signed [DW-1:0] img_buf [0:IMG_SZ-1];
+    (* ram_style = "block" *) reg signed [DW-1:0] out_buf [0:OUT_SZ-1];
+    (* ram_style = "block" *) reg signed [DW-1:0] fmap_a  [0:FMAP_SZ-1];
+    (* ram_style = "block" *) reg signed [DW-1:0] fmap_b  [0:FMAP_SZ-1];
+    reg ping_pong;
+
+    assign out_rd_data = out_buf[out_rd_addr];
+
+    always @(posedge clk)
+        if (img_wr_en) img_buf[img_wr_addr] <= img_wr_data;
+    // ── Layer config registers ────────────────────────────────────────────────
+    reg [9:0]  cfg_h_in, cfg_w_in, cfg_h_out, cfg_w_out;
+    reg [11:0] cfg_c_in, cfg_c_out;
+    reg [3:0]  cfg_k, cfg_stride, cfg_pad;
+    reg        cfg_mode;
+    reg [25:0] cfg_weight_base;
+    reg [11:0] cfg_bias_base;
+
+    // ── Bias memory ───────────────────────────────────────────────────────────
+    reg signed [DW-1:0] bias_mem [0:4095];
+
+    // ── Conv core wires ───────────────────────────────────────────────────────
+    reg         conv_wr_en_r;
+    reg  [1:0]  conv_wr_sel;
+    reg  [25:0] conv_wr_addr_r;
+    reg  signed [DW-1:0] conv_wr_data_r;
+
+    reg         conv_start_r;
+    wire        conv_done_w;
+    reg  [17:0] conv_rd_addr_r;
+    wire signed [ACC_W-1:0] conv_rd_data_w;
+
+    wire [11:0] current_c_out;
+    wire signed [DW-1:0] current_bias = bias_mem[cfg_bias_base + current_c_out];
+
+    conv_unified #(.DW(DW),.ACC_W(ACC_W)) u_CONV_CORE (
+        .clk(clk), .rst_n(rst_n), .start(conv_start_r), .done(conv_done_w),
+        .wr_en(conv_wr_en_r), .wr_sel(conv_wr_sel),
+        .wr_addr(conv_wr_addr_r), .wr_data(conv_wr_data_r),
+        .cfg_h_in(cfg_h_in), .cfg_w_in(cfg_w_in),
+        .cfg_h_out(cfg_h_out), .cfg_w_out(cfg_w_out),
+        .cfg_c_in(cfg_c_in), .cfg_c_out(cfg_c_out),
+        .cfg_k(cfg_k), .cfg_stride(cfg_stride), .cfg_pad(cfg_pad),
+        .cfg_mode(cfg_mode), .cfg_weight_base(cfg_weight_base),
+        .bias_val(current_bias),
+        .current_c_out(current_c_out),
+        .rd_addr(conv_rd_addr_r), .rd_data(conv_rd_data_w)
+    );
+
+    // ── Conv output → Q7.8 truncation with rounding & saturation ─────────────
+    wire signed [ACC_W-1:0] acc_rounded  = conv_rd_data_w + (48'sd1 << (FRAC_W-1));
+    wire signed [ACC_W-FRAC_W-1:0] acc_shifted = acc_rounded[ACC_W-1:FRAC_W];
+
+    wire sat_pos = ($signed(acc_shifted) >  $signed(40'sd32767));
+    wire sat_neg = ($signed(acc_shifted) < -$signed(40'sd32768));
+    wire signed [DW-1:0] conv_rd_trunc =
+        sat_pos ? SAT_MAX : (sat_neg ? SAT_MIN : acc_shifted[DW-1:0]);
+
+    // ── Activation units ──────────────────────────────────────────────────────
+    wire signed [DW-1:0] lrelu_out, relu_out, tanh_out_w;
+    wire lrelu_valid, relu_valid, tanh_valid;
+    reg  act_valid_in;
+    reg  signed [DW-1:0] act_x_in;
+
+    leaky_relu #(.DW(DW),.FRAC_W(FRAC_W)) u_lrelu (
+        .valid_in(act_valid_in), .x_in(act_x_in),
+        .valid_out(lrelu_valid), .y_out(lrelu_out));
+    relu #(.DW(DW)) u_relu (
+        .valid_in(act_valid_in), .x_in(act_x_in),
+        .valid_out(relu_valid),  .y_out(relu_out));
+    tanh_act #(.DW(DW),.FRAC_W(FRAC_W)) u_tanh (
+        .clk(clk), .valid_in(act_valid_in), .x_in(act_x_in),
+        .valid_out(tanh_valid), .y_out(tanh_out_w));
+
+    // act_sel: 0=leaky_relu, 1=relu, 2=tanh, 3=bypass(no activation)
+    reg [1:0] act_sel;
+    wire act_y_valid = (act_sel==2'd0) ? lrelu_valid :
+                       (act_sel==2'd1) ? relu_valid  :
+                       (act_sel==2'd2) ? tanh_valid  : act_valid_in;
+    wire signed [DW-1:0] act_y_out =
+                       (act_sel==2'd0) ? lrelu_out  :
+                       (act_sel==2'd1) ? relu_out   :
+                       (act_sel==2'd2) ? tanh_out_w : act_x_in;
+
+    // ── [FIX-5] Registered pixels_per_ch ─────────────────────────────────────
+    // Disimpan ke register saat set_layer_info dipanggil sehingga stabil
+    // selama seluruh ST_READBACK dan ST_ACT_FLUSH.
+    reg [17:0] pixels_per_ch_r;   // = cur_h_out * cur_w_out
+
+    // ── Layer state ───────────────────────────────────────────────────────────
+    reg [3:0]  state, layer_idx;
+    reg [25:0] target_base_addr;
+    reg [11:0] target_bias_base;
+
+    always @(*) begin
+        case (wr_layer)
+            4'd0:  begin target_base_addr=26'd0;       target_bias_base=12'd0;    end // E1
+            4'd1:  begin target_base_addr=26'd3072;    target_bias_base=12'd32;   end // E2
+            4'd2:  begin target_base_addr=26'd68608;   target_bias_base=12'd96;   end // E3
+            4'd3:  begin target_base_addr=26'd199680;  target_bias_base=12'd224;  end // E4
+            4'd4:  begin target_base_addr=26'd723968;  target_bias_base=12'd480;  end // E5
+            4'd5:  begin target_base_addr=26'd2821120; target_bias_base=12'd992;  end // BOT
+            4'd6:  begin target_base_addr=26'd3083264; target_bias_base=12'd1504; end // D1
+            4'd7:  begin target_base_addr=26'd5180672; target_bias_base=12'd1760; end // D2
+            4'd8:  begin target_base_addr=26'd5705088; target_bias_base=12'd1888; end // D3
+            4'd9:  begin target_base_addr=26'd5836288; target_bias_base=12'd1952; end // D4
+            4'd10: begin target_base_addr=26'd5869088; target_bias_base=12'd1984; end // D5
+            4'd11: begin target_base_addr=26'd5901888; target_bias_base=12'd2016; end // OUT
+            default: begin target_base_addr=26'd0;     target_bias_base=12'd0;    end
+        endcase
+    end
+
+    // ── Write interface ───────────────────────────────────────────────────────
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            conv_wr_en_r <= 0; conv_wr_sel <= 0;
+            conv_wr_addr_r <= 0; conv_wr_data_r <= 0;
+        end else begin
+            conv_wr_en_r <= 0;
+
+            if (wr_en) begin
+                if (wr_type == 2'd0) begin
+                    // Conv weight → weight_mem di conv_unified
+                    conv_wr_sel    <= 2'd1;
+                    conv_wr_en_r   <= 1'b1;
+                    conv_wr_addr_r <= target_base_addr + wr_addr;
+                    conv_wr_data_r <= wr_data;
+                end else if (wr_type == 2'd3) begin
+                    // Conv bias (folded BN offset) → bias_mem
+                    bias_mem[target_bias_base + wr_addr[11:0]] <= wr_data;
+                end
+                // wr_type 1,2 tidak dipakai lagi (BN sudah di-fold)
+            end else if (state == ST_LOAD_INPUT && rb_cnt < cur_ifmap_sz) begin
+                conv_wr_en_r   <= 1'b1;
+                conv_wr_sel    <= 2'd0;
+                conv_wr_addr_r <= rb_cnt[17:0];
+                conv_wr_data_r <= (layer_idx == 0) ? img_buf[rb_cnt[13:0]]
+                                : (ping_pong      ? fmap_b[rb_cnt]
+                                                  : fmap_a[rb_cnt]);
+            end
+        end
+    end
+
+    // ── Layer config & size ───────────────────────────────────────────────────
+    reg [11:0] cur_c_out;
+    reg [9:0]  cur_h_out, cur_w_out;
+    reg [1:0]  cur_act;         // 0=lrelu,1=relu,2=tanh,3=bypass
+    reg [17:0] cur_ifmap_sz;
+    reg [17:0] rb_cnt;
+    reg [17:0] rb_total;
+    reg [17:0] fmap_wr_ptr;
+
+    localparam ST_IDLE       = 4'd0;
+    localparam ST_LOAD_INPUT = 4'd1;
+    localparam ST_CONV_START = 4'd2;
+    localparam ST_CONV_WAIT  = 4'd3;
+    localparam ST_READBACK   = 4'd4;
+    localparam ST_ACT_FLUSH  = 4'd5;
+    localparam ST_NEXT_LAYER = 4'd6;
+    localparam ST_DONE       = 4'd7;
+
+    task set_layer_info;
+        input [3:0] idx;
+        begin
+            case (idx)
+                // cur_act: 0=leaky_relu, 1=relu, 2=tanh, 3=bypass
+                4'd0:  begin cfg_c_in=12'd3;   cfg_c_out=12'd32;  cfg_h_in=10'd64; cfg_w_in=10'd64; cfg_h_out=10'd32; cfg_w_out=10'd32; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd0;       cur_act=2'd0; cur_ifmap_sz=18'd12288;  cfg_bias_base=12'd0;    end // E1  3*64*64=12288
+                4'd1:  begin cfg_c_in=12'd32;  cfg_c_out=12'd64;  cfg_h_in=10'd32; cfg_w_in=10'd32; cfg_h_out=10'd16; cfg_w_out=10'd16; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd3072;    cur_act=2'd0; cur_ifmap_sz=18'd32768;  cfg_bias_base=12'd32;   end // E2  32*32*32=32768
+                4'd2:  begin cfg_c_in=12'd64;  cfg_c_out=12'd128; cfg_h_in=10'd16; cfg_w_in=10'd16; cfg_h_out=10'd8;  cfg_w_out=10'd8;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd68608;   cur_act=2'd0; cur_ifmap_sz=18'd16384; cfg_bias_base=12'd96;   end // E3  64*16*16=16384
+                4'd3:  begin cfg_c_in=12'd128; cfg_c_out=12'd256; cfg_h_in=10'd8;  cfg_w_in=10'd8;  cfg_h_out=10'd4;  cfg_w_out=10'd4;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd199680;  cur_act=2'd0; cur_ifmap_sz=18'd8192;   cfg_bias_base=12'd224;  end // E4  128*8*8=8192
+                4'd4:  begin cfg_c_in=12'd256; cfg_c_out=12'd512; cfg_h_in=10'd4;  cfg_w_in=10'd4;  cfg_h_out=10'd2;  cfg_w_out=10'd2;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd723968;  cur_act=2'd0; cur_ifmap_sz=18'd4096;   cfg_bias_base=12'd480;  end // E5  256*4*4=4096
+                4'd5:  begin cfg_c_in=12'd512; cfg_c_out=12'd512; cfg_h_in=10'd2;  cfg_w_in=10'd2;  cfg_h_out=10'd2;  cfg_w_out=10'd2;  cfg_k=4'd1; cfg_stride=4'd1; cfg_pad=4'd0; cfg_mode=1'b0; cfg_weight_base=26'd2821120; cur_act=2'd3; cur_ifmap_sz=18'd2048;   cfg_bias_base=12'd992;  end // BOT 512*2*2=2048, bypass
+                4'd6:  begin cfg_c_in=12'd512; cfg_c_out=12'd256; cfg_h_in=10'd2;  cfg_w_in=10'd2;  cfg_h_out=10'd4;  cfg_w_out=10'd4;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd3083264; cur_act=2'd1; cur_ifmap_sz=18'd2048;   cfg_bias_base=12'd1504; end // D1  512*2*2=2048
+                4'd7:  begin cfg_c_in=12'd256; cfg_c_out=12'd128; cfg_h_in=10'd4;  cfg_w_in=10'd4;  cfg_h_out=10'd8;  cfg_w_out=10'd8;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5180672; cur_act=2'd1; cur_ifmap_sz=18'd4096;   cfg_bias_base=12'd1760; end // D2  256*4*4=4096
+                4'd8:  begin cfg_c_in=12'd128; cfg_c_out=12'd64;  cfg_h_in=10'd8;  cfg_w_in=10'd8;  cfg_h_out=10'd16; cfg_w_out=10'd16; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5705088; cur_act=2'd1; cur_ifmap_sz=18'd8192;   cfg_bias_base=12'd1888; end // D3  128*8*8=8192
+                4'd9:  begin cfg_c_in=12'd64;  cfg_c_out=12'd32;  cfg_h_in=10'd16; cfg_w_in=10'd16; cfg_h_out=10'd32; cfg_w_out=10'd32; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5836288; cur_act=2'd1; cur_ifmap_sz=18'd16384; cfg_bias_base=12'd1952; end // D4  64*16*16=16384
+                4'd10: begin cfg_c_in=12'd32;  cfg_c_out=12'd32;  cfg_h_in=10'd32; cfg_w_in=10'd32; cfg_h_out=10'd64; cfg_w_out=10'd64; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5869088; cur_act=2'd1; cur_ifmap_sz=18'd32768; cfg_bias_base=12'd1984; end // D5  32*32*32=32768
+                4'd11: begin cfg_c_in=12'd32;  cfg_c_out=12'd3;   cfg_h_in=10'd64; cfg_w_in=10'd64; cfg_h_out=10'd64; cfg_w_out=10'd64; cfg_k=4'd3; cfg_stride=4'd1; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd5901888; cur_act=2'd2; cur_ifmap_sz=18'd131072; cfg_bias_base=12'd2016; end // OUT 32*64*64=131072
+                default: begin cfg_c_in=12'd0; cfg_c_out=12'd0; cfg_h_in=10'd0; cfg_w_in=10'd0; cfg_h_out=10'd0; cfg_w_out=10'd0; cfg_k=4'd0; cfg_stride=4'd0; cfg_pad=4'd0; cfg_mode=1'b0; cfg_weight_base=26'd0; cur_act=2'd3; cur_ifmap_sz=18'd0; cfg_bias_base=12'd0; end
+            endcase
+
+            cur_c_out        = cfg_c_out;
+            cur_h_out        = cfg_h_out;
+            cur_w_out        = cfg_w_out;
+            rb_total         = {6'b0, cfg_c_out} * {6'b0, cfg_h_out} * {6'b0, cfg_w_out};
+            // [FIX-5] Set pixels_per_ch_r bersamaan saat layer info di-set
+            pixels_per_ch_r  = {8'b0, cfg_h_out} * {8'b0, cfg_w_out};
+        end
+    endtask
+
+    // leaky_relu, relu : 0 cycle latency (combinational) → flush_needed=0
+    // tanh_act         : 1 cycle latency (registered)   → flush_needed=1
+    reg [1:0] flush_cnt;
+    wire flush_done = (flush_cnt == 2'd0);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= ST_IDLE;
+            done <= 0; layer_idx <= 0;
+            ping_pong <= 0; conv_start_r <= 0;
+            act_valid_in <= 0; act_x_in <= 0;
+            rb_cnt <= 0; fmap_wr_ptr <= 0;
+            conv_rd_addr_r <= 18'd0;
+            flush_cnt <= 0;
+        end else begin
+            done         <= 0;
+            conv_start_r <= 0;
+            act_valid_in <= 0;
+
+            case (state)
+
+            ST_IDLE: begin
+                if (start) begin
+                    layer_idx <= 4'd0; ping_pong <= 0;
+                    set_layer_info(4'd0);
+                    rb_cnt <= 0;
+                    state  <= ST_LOAD_INPUT;
+                    $display("[TOP] Inference start");
+                end
+            end
+
+            ST_LOAD_INPUT: begin
+                if (rb_cnt < cur_ifmap_sz) begin
+                    rb_cnt <= rb_cnt + 1;
+                end else begin
+                    rb_cnt <= 0;
+                    state  <= ST_CONV_START;
+                end
+            end
+
+            ST_CONV_START: begin
+                conv_start_r <= 1'b1;
+                state        <= ST_CONV_WAIT;
+            end
+
+            ST_CONV_WAIT: begin
+                if (conv_done_w) begin
+                    rb_cnt         <= 0;
+                    fmap_wr_ptr    <= 0;
+                    act_sel        <= cur_act;
+                    conv_rd_addr_r <= 18'd0;
+                    state          <= ST_READBACK;
+                end
+            end
+
+            // ── ST_READBACK ──────────────────────────────────────────────────
+            ST_READBACK: begin
+                if (rb_cnt < rb_total) begin
+                    // Advance address untuk cycle berikutnya
+                    conv_rd_addr_r <= rb_cnt + 18'd1;
+                    rb_cnt         <= rb_cnt + 1;
+
+                    // Feed ke activation dari data yang dibaca sekarang
+                    if (cur_act == 2'd3) begin
+                        // Bypass — simpan langsung tanpa activation
+                        if (!ping_pong) fmap_b[fmap_wr_ptr] <= conv_rd_trunc;
+                        else            fmap_a[fmap_wr_ptr] <= conv_rd_trunc;
+                        fmap_wr_ptr <= fmap_wr_ptr + 1;
+                    end else begin
+                        act_valid_in <= 1'b1;
+                        act_x_in     <= conv_rd_trunc;
+                    end
+                end else begin
+                    // Readback selesai, masuk flush
+                    // Set flush_cnt sesuai pipeline depth activation
+                    // leaky_relu/relu: 0 cycle, tanh: 1 cycle
+                    flush_cnt <= (cur_act == 2'd2) ? 2'd1 : 2'd0;
+                    state     <= ST_ACT_FLUSH;
+                end
+
+                // Tangkap output activation (berlaku semua state readback)
+                if (cur_act != 2'd3 && act_y_valid) begin
+                    if (!ping_pong) fmap_b[fmap_wr_ptr] <= act_y_out;
+                    else            fmap_a[fmap_wr_ptr] <= act_y_out;
+                    fmap_wr_ptr <= fmap_wr_ptr + 1;
+                end
+            end
+
+            // ── ST_ACT_FLUSH ─────────────────────────────────────────────────
+            ST_ACT_FLUSH: begin
+                if (cur_act != 2'd3 && act_y_valid) begin
+                    if (!ping_pong) fmap_b[fmap_wr_ptr] <= act_y_out;
+                    else            fmap_a[fmap_wr_ptr] <= act_y_out;
+                    fmap_wr_ptr <= fmap_wr_ptr + 1;
+                end
+
+                if (flush_cnt > 0) begin
+                    flush_cnt <= flush_cnt - 1;
+                end else begin
+                    state <= ST_NEXT_LAYER;
+                end
+            end
+
+            ST_NEXT_LAYER: begin
+                begin : dump
+                    reg [8*40:1] fname;
+                    $sformat(fname, "outputs/rtl_layer_%0d.hex", layer_idx);
+                    if (!ping_pong) $writememh(fname, fmap_b, 0, rb_total-1);
+                    else            $writememh(fname, fmap_a, 0, rb_total-1);
+                    $display("[TOP] ✓ Layer %0d dumped (%0d values)", layer_idx, rb_total);
+                end
+
+                if (layer_idx == 4'd11) begin
+                    begin : copy_out
+                        integer k;
+                        for (k = 0; k < OUT_SZ; k = k + 1)
+                            out_buf[k] <= (!ping_pong) ? fmap_b[k] : fmap_a[k];
+                    end
+                    state <= ST_DONE;
+                end else begin
+                    ping_pong <= ~ping_pong;
+                    layer_idx <= layer_idx + 1;
+                    set_layer_info(layer_idx + 1);
+                    rb_cnt <= 0;
+                    state  <= ST_LOAD_INPUT;
+                    $display("[TOP] → Layer %0d", layer_idx + 1);
+                end
+            end
+
+            ST_DONE: begin
+                done  <= 1'b1;
+                state <= ST_IDLE;
+                $display("[TOP] Inference complete.");
+            end
+
+            endcase
+        end
+    end
+
+endmodule
+`default_nettype wire

@@ -1,0 +1,90 @@
+// =============================================================================
+// batchnorm2d.v — Clean Version (Dynamic Resolution Counter)
+// =============================================================================
+`timescale 1ns/1ps
+`default_nettype none
+
+module batchnorm2d #(
+    parameter DW = 16,
+    parameter FRAC_W = 8,
+    parameter C = 64
+)(
+    input wire clk,
+    input wire rst_n,
+    
+    // Write Interface (Weights)
+    input wire wr_en,
+    input wire wr_sel,      // 0: scale, 1: offset
+    input wire [8:0] wr_addr,
+    input wire signed [DW-1:0] wr_data,
+
+    // Data Interface
+    input wire [17:0] pixels_per_ch,
+    input wire x_valid,
+    input wire signed [DW-1:0] x_in,
+
+    output reg y_valid,
+    output reg signed [DW-1:0] y_out
+);
+
+    reg signed [DW-1:0] scale_mem [0:C-1];
+    reg signed [DW-1:0] offset_mem [0:C-1];
+
+    always @(posedge clk) begin
+        if (wr_en) begin
+            if (wr_sel == 0) scale_mem[wr_addr] <= wr_data;
+            else             offset_mem[wr_addr] <= wr_data;
+        end
+    end
+
+    // Internal Counter untuk melacak Channel Index
+    reg [17:0] pixel_cnt;
+    reg [11:0] c_idx;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pixel_cnt <= 0;
+            c_idx     <= 0;
+        end else if (x_valid) begin
+            if (pixel_cnt == pixels_per_ch - 1) begin
+                pixel_cnt <= 0;
+                // Otomatis roll-over ke 0 saat channel terakhir selesai
+                if (c_idx == C - 1) c_idx <= 0;
+                else c_idx <= c_idx + 1;
+            end else begin
+                pixel_cnt <= pixel_cnt + 1;
+            end
+        end
+    end
+
+    // Pipeline 1 Cycle untuk kalkulasi
+    reg signed [DW-1:0] x_in_r;
+    reg x_valid_r;
+    reg signed [DW-1:0] scale_r, offset_r;
+    
+    wire signed [31:0] mult_res = $signed(x_in_r) * $signed(scale_r);
+    wire signed [31:0] shifted_res = (mult_res >>> FRAC_W) + $signed({{16{offset_r[DW-1]}}, offset_r});
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            x_valid_r <= 0; y_valid <= 0;
+            y_out <= 0;
+        end else begin
+            x_valid_r <= x_valid;
+            x_in_r    <= x_in;
+            scale_r   <= scale_mem[c_idx];
+            offset_r  <= offset_mem[c_idx];
+
+            y_valid <= x_valid_r;
+            if (x_valid_r) begin
+            		if (shifted_res > 32767)
+            				y_out <= 16'sd32767;
+            		else if (shifted_res < -32768)
+            				y_out <= -16'sd32768;
+            		else
+            				y_out <= shifted_res[31:0];
+            end
+        end
+    end
+endmodule
+`default_nettype wire

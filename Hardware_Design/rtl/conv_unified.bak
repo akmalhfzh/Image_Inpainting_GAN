@@ -1,0 +1,200 @@
+// =============================================================================
+// conv_unified_fixed.v
+// =============================================================================
+`timescale 1ns/1ps
+`default_nettype none
+
+module conv_unified #(
+    parameter DW    = 16,
+    parameter ACC_W = 48
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,
+    output reg  done,
+
+    input  wire                   wr_en,
+    input  wire [1:0]             wr_sel,
+    input  wire [25:0]            wr_addr,
+    input  wire signed [DW-1:0]   wr_data,
+
+    input  wire [9:0]  cfg_h_in,  cfg_w_in,
+    input  wire [9:0]  cfg_h_out, cfg_w_out,
+    input  wire [11:0] cfg_c_in,  cfg_c_out,
+    input  wire [3:0]  cfg_k, cfg_stride, cfg_pad,
+    input  wire        cfg_mode,
+    input  wire [25:0] cfg_weight_base,
+
+    input  wire signed [DW-1:0] bias_val,
+    output wire [11:0]          current_c_out,
+
+    input  wire [17:0]             rd_addr,
+    output wire signed [ACC_W-1:0] rd_data
+);
+
+    localparam N_MAC        = 16;
+    localparam MAX_IFMAP_SZ = 262144;
+    localparam MAX_WEIGHT_SZ= 40500000;
+    // [FIX-1] MAX_OFMAP_SZ harus cukup untuk semua layer.
+    // Layer terbesar: D5 = 32*64*64 = 131072, E1 = 32*32*32 = 32768
+    // 131072 = 2^17, aman di 262144 = 2^18.
+    localparam MAX_OFMAP_SZ = 262144;
+
+    reg signed [DW-1:0]    ifmap_mem  [0:MAX_IFMAP_SZ-1];
+    reg signed [DW-1:0]    weight_mem [0:MAX_WEIGHT_SZ-1];
+    // [FIX-2] Index array diperlebar ke 19-bit agar konsisten dengan ofmap_addr
+    reg signed [ACC_W-1:0] ofmap_mem  [0:MAX_OFMAP_SZ-1];
+
+    // [FIX-2] rd_data tetap bisa diakses dengan rd_addr [17:0] karena
+    // MAX_OFMAP_SZ = 262144 dan rd_addr terbesar = 131071 < 262144
+    assign rd_data = ofmap_mem[rd_addr];
+
+    always @(posedge clk) begin
+        if (wr_en) begin
+            if (wr_sel == 2'd0) ifmap_mem[wr_addr[17:0]] <= wr_data;
+            if (wr_sel == 2'd1) weight_mem[wr_addr]      <= wr_data;
+        end
+    end
+
+    reg [11:0] c_out_cnt, c_in_cnt;
+    reg [9:0]  h_cnt, w_cnt;
+
+    assign current_c_out = c_out_cnt;
+
+    wire [N_MAC*18-1:0] ifmap_addrs;
+    wire [N_MAC*26-1:0] weight_addrs;
+    wire [N_MAC-1:0]    valid_vec;
+
+    addr_gen u_addr_gen (
+        .c_out(c_out_cnt), .c_in(c_in_cnt), .h_out(h_cnt), .w_out(w_cnt),
+        .cfg_h_in(cfg_h_in), .cfg_w_in(cfg_w_in),
+        .cfg_c_in(cfg_c_in), .cfg_c_out(cfg_c_out),
+        .cfg_k(cfg_k), .cfg_stride(cfg_stride), .cfg_pad(cfg_pad),
+        .cfg_mode(cfg_mode), .cfg_weight_base(cfg_weight_base),
+        .ifmap_addrs(ifmap_addrs), .weight_addrs(weight_addrs),
+        .valid_vec(valid_vec)
+    );
+
+    wire [N_MAC*DW-1:0] weight_vec, ifmap_vec;
+    genvar t;
+    generate
+        for (t = 0; t < N_MAC; t = t + 1) begin : FETCH
+            wire [25:0] wa = weight_addrs[t*26 +: 26];
+            wire [17:0] ia = ifmap_addrs [t*18 +: 18];
+            assign weight_vec[t*DW +: DW] = weight_mem[wa];
+            assign ifmap_vec [t*DW +: DW] = ifmap_mem [ia];
+        end
+    endgenerate
+
+    wire signed [ACC_W-1:0] row_sum;
+    mac_array #(.DW(DW), .ACC_W(ACC_W), .K(4)) u_mac_array (
+        .weight_vec(weight_vec), .ifmap_vec(ifmap_vec), .valid_vec(valid_vec),
+        .sum_out(row_sum)
+    );
+
+    reg signed [ACC_W-1:0] acc_reg;
+
+    wire is_first = (c_in_cnt == 12'd0);
+    // [FIX-3] Guard is_last: defaultnya 0 kalau cfg_c_in = 0
+    wire is_last  = (cfg_c_in > 0) && (c_in_cnt == cfg_c_in - 1);
+    wire all_done = is_last &&
+                   (w_cnt     == cfg_w_out - 1) &&
+                   (h_cnt     == cfg_h_out - 1) &&
+                   (c_out_cnt == cfg_c_out - 1);
+
+    // Bias: Q7.8 di-shift 8 ke kiri → align dengan format Q15.16 di accumulator
+    wire signed [ACC_W-1:0] bias_extended =
+        {{(ACC_W-DW){bias_val[DW-1]}}, bias_val} <<< FRAC_W_LOCAL;
+
+    // acc_next: saat c_in pertama, muat bias + row_sum; selanjutnya akumulasi
+    wire signed [ACC_W-1:0] acc_next =
+        is_first ? (bias_extended + row_sum) : (acc_reg + row_sum);
+
+    // [FIX-1] ofmap_addr diperlebar ke 20-bit dan intermediate dihitung eksplisit
+    // agar perkalian 10-bit × 10-bit tidak dipotong oleh Verilog ke 10-bit.
+    //
+    // Bug asli: cfg_h_out [9:0] * cfg_w_out [9:0]
+    //           Verilog mengevaluasi ini dalam lebar max(9,9)+1 = 10 bit (unsigned).
+    //           64 * 64 = 4096 = 12-bit → dipotong jadi 10-bit → 4096 & 1023 = 0! SALAH!
+    //
+    // Fix: cast eksplisit ke [19:0] sebelum perkalian.
+    wire [19:0] hw_out     = {10'b0, cfg_h_out} * {10'b0, cfg_w_out};
+    wire [19:0] ofmap_addr = c_out_cnt * hw_out + h_cnt * {10'b0, cfg_w_out} + w_cnt;
+
+    localparam FRAC_W_LOCAL = 8;  // = FRAC_W dari generator_top
+
+    localparam IDLE    = 1'b0;
+    localparam COMPUTE = 1'b1;
+    reg state;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state     <= IDLE; done <= 0; acc_reg <= 0;
+            c_out_cnt <= 0; h_cnt <= 0; w_cnt <= 0; c_in_cnt <= 0;
+        end else begin
+            done <= 0;
+            case (state)
+                IDLE: if (start) begin
+                    c_out_cnt <= 0; h_cnt <= 0; w_cnt <= 0; c_in_cnt <= 0;
+                    state <= COMPUTE;
+                end
+
+                COMPUTE: begin
+                    acc_reg <= acc_next;
+
+                    if (is_last) begin
+                        // [FIX-2] Gunakan ofmap_addr [19:0] — tidak terpotong
+                        ofmap_mem[ofmap_addr] <= acc_next;
+                        c_in_cnt <= 0;
+
+                        if (all_done) begin
+                            done  <= 1;
+                            state <= IDLE;
+                        end else begin
+                            if (w_cnt == cfg_w_out - 1) begin
+                                w_cnt <= 0;
+                                if (h_cnt == cfg_h_out - 1) begin
+                                    h_cnt     <= 0;
+                                    c_out_cnt <= c_out_cnt + 1;
+                                end else begin
+                                    h_cnt <= h_cnt + 1;
+                                end
+                            end else begin
+                                w_cnt <= w_cnt + 1;
+                            end
+                        end
+                    end else begin
+                        c_in_cnt <= c_in_cnt + 1;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // =========================================================================
+    // synthesis translate_off
+    // =========================================================================
+    // [FIX-4] Overflow monitor: threshold disesuaikan dengan format Q(ACC_W-16).16
+    // Output akhir setelah shift-8 di generator_top adalah Q7.8 (16-bit signed).
+    // Jadi yang kita jaga: acc_next setelah di-shift-8 harus muat di 16-bit signed.
+    // Equivalently: acc_next harus muat di (16+8)=24-bit signed.
+    // → Bit [ACC_W-1:23] harus semua sama dengan bit [22] (sign extension).
+    always @(posedge clk) begin
+        if (state == COMPUTE && is_last) begin
+            if (acc_next[ACC_W-1:24] != {(ACC_W-24){acc_next[23]}}) begin
+                $display("[CONV_OVERFLOW] c_out=%0d h=%0d w=%0d acc=%0d (0x%0h)",
+                         c_out_cnt, h_cnt, w_cnt, $signed(acc_next), acc_next);
+            end
+        end
+        // Monitor ofmap_addr untuk deteksi address conflict (debug)
+        if (state == COMPUTE && is_last) begin
+            if (ofmap_addr >= MAX_OFMAP_SZ) begin
+                $display("[ADDR_OVERFLOW] ofmap_addr=%0d >= MAX_OFMAP_SZ=%0d — OUT OF BOUNDS!",
+                         ofmap_addr, MAX_OFMAP_SZ);
+            end
+        end
+    end
+    // synthesis translate_on
+
+endmodule
+`default_nettype wire
