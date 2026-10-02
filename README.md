@@ -1,4 +1,4 @@
-# Image_Inpainting_GAN
+# Image Inpainting using Context Encoder GAN on FPGA
 Full-stack hardware accelerator for Context Encoder GAN. End-to-end implementation from PyTorch model training to custom Verilog RTL deployment (Conv, MAC, BatchNorm) on Xilinx Zynq/PYNQ FPGA.
 
 
