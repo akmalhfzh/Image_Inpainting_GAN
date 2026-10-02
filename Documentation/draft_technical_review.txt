@@ -1,0 +1,68 @@
+================================================================================
+TECHNICAL REVIEW AND CORRECTIONS: IEEE ACCESS DRAFT (Integrate5.4)
+================================================================================
+
+1. CODE MATCH VERIFICATION (Integrate5.4)
+--------------------------------------------------------------------------------
+Below is the verification of the technical claims in your draft compared directly against your Verilog code in the `Integrate5.4/rtl/` directory:
+
+[VERIFIED] 16-bit fixed-point arithmetic with 8 fractional bits
+- Code Source: `mac_array.v` (parameter DW = 16, ACC_W = 48), `conv_unified.v` (parameter FRAC_W = 8).
+- Mechanism: The multiplication produces a 32-bit product which is sign-extended to 48 bits (ACC_W). The accumulation result is then shifted right by 8 bits (`FRAC_W_LOCAL`) to restore the 8-bit fractional format, followed by saturation (`sat_pos`, `sat_neg`). This exactly matches the math described in the draft.
+
+[VERIFIED] Unified Convolution Engine
+- Code Source: `conv_unified.v`
+- Mechanism: The module uses `cfg_mode` to switch between standard convolution (mode 0) and transposed convolution (mode 1), utilizing the same MAC arrays and dynamic addressing logic. 
+
+[VERIFIED] 16-way Pipelined MAC Datapath
+- Code Source: `mac_array.v`
+- Mechanism: The module instantiates 16 parallel signed multipliers (`N_MAC = K * K` where `K = 4`) and uses a binary adder tree. It also features a configurable pipeline (`PIPE_STAGES = 2`), matching the 16-way pipelined MAC description in the text.
+
+[VERIFIED] Ping-Pong Feature Map Buffering
+- Code Source: `generator_top.v`
+- Mechanism: The `ping_pong` register toggles (`ping_pong <= ~ping_pong`) at the end of each layer, effectively swapping `reg_fmap_a_base` and `reg_fmap_b_base` for read/write operations.
+
+[VERIFIED] Activations (LeakyReLU, ReLU, Tanh)
+- Code Source: `conv_unified.v`, `leaky_relu.v`, `relu.v`, `tanh_act.v`
+- Mechanism: The datapath routes the truncated output to the instantiated activation modules, multiplexed by the `cur_act` register (0: LReLU, 1: ReLU, 2: Tanh, 3: None).
+
+
+2. MATHEMATICAL / CALCULATIONS SANITY CHECK
+--------------------------------------------------------------------------------
+- Cycle Latency Calculation: 326,774,321 cycles / 60 MHz = 5.4462 seconds. 
+  Draft writes: 5.44 s. (Accurate, can optionally round to 5.45 s).
+- Energy Calculation: 2.45 W (Active) * 5.55 s (Latency) = 13.5975 Joules. 
+  Draft writes: 13.59 J. (Accurate, can optionally round to 13.60 J).
+- CPU vs FPGA Speedup: 29.50 s / 5.55 s = 5.315x. 
+  Draft writes: 5.32x. (Accurate).
+- E2 Layer Parameter Count: 4x4x32x64 = 32,768 weights + 64 bias = 32,832. 
+  Draft table writes: 32,960. 
+  Difference is 128 parameters, which perfectly accounts for Batch Normalization parameters (64 gamma + 64 beta). (Accurate and consistent).
+
+
+3. DRAFT TEXT CORRECTIONS (To be revised before submission)
+--------------------------------------------------------------------------------
+The draft is generally well-structured. However, there are several "notes-to-self" embedded in the main text that must be rewritten into formal academic statements. 
+
+REVISION 1: Post-Processing Section
+- Current (Line 920): "The image-quality results reported in this manuscript should specify whether mean-color correction is enabled. To isolate the contribution of the fixed-point generator itself, the primary results should be reported without color correction, with corrected results optionally provided as an additional experiment."
+- Suggested Fix: "In our evaluation, the primary image-quality results are reported without mean-color correction to isolate the contribution of the fixed-point hardware generator. Corrected results are optionally provided as an additional experiment."
+
+REVISION 2: Latency, Power, and Energy Measurement Section
+- Current (Line 956): "The manuscript should specify the exact measurement point and whether the reported power corresponds to total board power, programmable-logic power, or another measured rail."
+- Suggested Fix: Explicitly state the measurement method here. For example: "The active power measurement (2.45 W) corresponds to the total board power consumption measured at the main power rail of the PYNQ-Z1 platform." (Adjust based on how you actually measured it).
+
+REVISION 3: CPU-FPGA Comparison Section
+- Current (Line 1223): "This ratio should be described as a measured latency reduction relative to the embedded ARM baseline under the stated experimental conditions, rather than as a general FPGA speedup."
+- Suggested Fix: "It should be noted that this ratio represents a measured latency reduction relative to the embedded ARM baseline under these specific experimental conditions, rather than a generalized architectural FPGA speedup."
+
+
+4. OUTSTANDING TODOs (Data to be added)
+--------------------------------------------------------------------------------
+- Section V.A: Add the exact train/validation/test split numbers, random seed, and exact random-mask generation procedure.
+- Section VI.D: Add the second table containing mask-region-only PSNR and SSIM. The current full-image PSNR inflates the score since the unmasked region is directly copied.
+- Acknowledgment: Adjust the IEEE AI-generated content disclosure template to accurately reflect the AI tool usage for editing.
+
+================================================================================
+END OF REVIEW
+================================================================================

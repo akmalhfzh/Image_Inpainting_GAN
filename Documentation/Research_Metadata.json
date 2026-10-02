@@ -1,0 +1,40 @@
+{
+  "project_name": "Context Encoder GAN - Hardware Accelerator",
+  "version": "Integrate 5.4",
+  "target_platform": "Xilinx Zynq / PYNQ FPGA",
+  "languages": [
+    "Verilog (RTL)",
+    "C++ (Verilator Testbench)",
+    "Python (PyTorch Reference & Verification)",
+    "Tcl (Vivado Automation)",
+    "Makefile"
+  ],
+  "eda_tools": [
+    "Verilator (Cycle-accurate Simulation)",
+    "Icarus Verilog (Waveform Simulation)",
+    "Vivado 2023.2 (Synthesis & Implementation)"
+  ],
+  "key_modules": {
+    "top": "generator_top.v",
+    "axi_wrapper": "gan_axi_wrapper.v",
+    "compute": [
+      "conv_unified.v",
+      "mac_array.v"
+    ],
+    "memory_controller": "addr_gen.v",
+    "activations": [
+      "batchnorm2d.v",
+      "leaky_relu.v",
+      "relu.v",
+      "tanh_act.v"
+    ]
+  },
+  "simulation_memory_map": {
+    "BASE_WEIGHT": "0x0000000",
+    "BASE_IMG": "0x4000000",
+    "BASE_FMAP_A": "0x5000000",
+    "BASE_FMAP_B": "0x6000000",
+    "BASE_OUT": "0x7000000"
+  },
+  "current_status": "Bitstream generated, RTL verified against PyTorch, output images verified."
+}

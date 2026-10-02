@@ -1,0 +1,1970 @@
+// =============================================================================
+// generator_top (AXI DDR-Backed)
+// =============================================================================
+`timescale 1ns/1ps
+`default_nettype none
+
+module generator_top #(
+    parameter DW     = 16,
+    parameter FRAC_W = 8,
+    parameter ACC_W  = 48
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,
+    output reg  done,
+
+    // AXI4 Master Interface
+    output wire [31:0] m_axi_araddr,
+    output wire [7:0]  m_axi_arlen,
+    output wire [2:0]  m_axi_arsize,
+    output wire [1:0]  m_axi_arburst,
+    output wire        m_axi_arvalid,
+    input  wire        m_axi_arready,
+    input  wire [31:0] m_axi_rdata,
+    input  wire [1:0]  m_axi_rresp,
+    input  wire        m_axi_rlast,
+    input  wire        m_axi_rvalid,
+    output wire        m_axi_rready,
+
+    output wire [31:0] m_axi_awaddr,
+    output wire [7:0]  m_axi_awlen,
+    output wire [2:0]  m_axi_awsize,
+    output wire [1:0]  m_axi_awburst,
+    output wire        m_axi_awvalid,
+    input  wire        m_axi_awready,
+    output wire [31:0] m_axi_wdata,
+    output wire [3:0]  m_axi_wstrb,
+    output wire        m_axi_wlast,
+    output wire        m_axi_wvalid,
+    input  wire        m_axi_wready,
+    input  wire [1:0]  m_axi_bresp,
+    input  wire        m_axi_bvalid,
+    output wire        m_axi_bready,
+
+    // DDR Base addresses from AXI-Lite
+    input  wire [31:0] reg_img_base,
+    input  wire [31:0] reg_fmap_a_base,
+    input  wire [31:0] reg_fmap_b_base,
+    input  wire [31:0] reg_out_base,
+    input  wire [31:0] reg_weight_base,
+
+    // Bias write interface (from AXI-Lite wrapper)
+    input  wire                 wr_en,
+    input  wire [3:0]           wr_layer,
+    input  wire [1:0]           wr_type,
+    input  wire [17:0]          wr_addr,
+    input  wire signed [DW-1:0] wr_data,
+    
+    // Debug
+    output wire                 dbg_layer_done,
+    output wire [3:0]           dbg_layer_idx,
+    output wire [3:0]           dbg_state
+);
+    localparam ST_IDLE       = 4'd0;
+    localparam ST_CONV_START = 4'd1;
+    localparam ST_CONV_WAIT  = 4'd2;
+    localparam ST_NEXT_LAYER = 4'd3;
+    localparam ST_DONE       = 4'd4;
+
+    reg [3:0] state, layer_idx;
+    reg ping_pong;
+
+    assign dbg_layer_idx  = layer_idx;
+    assign dbg_layer_done = (state == ST_NEXT_LAYER) || (state == ST_DONE);
+    assign dbg_state      = state;
+
+    reg [11:0] cur_c_out;
+    reg [9:0]  cur_h_out, cur_w_out;
+    reg [1:0]  cur_act;
+
+    reg [9:0]  cfg_h_in, cfg_w_in, cfg_h_out, cfg_w_out;
+    reg [11:0] cfg_c_in, cfg_c_out;
+    reg [3:0]  cfg_k, cfg_stride, cfg_pad;
+    reg        cfg_mode;
+    reg [25:0] cfg_weight_base;
+    reg [11:0] cfg_bias_base;
+
+    reg signed [DW-1:0] bias_mem [0:4095];
+
+    // DDR addresses for current layer
+    wire [31:0] cur_ifmap_base = 
+        (layer_idx == 0) ? reg_img_base :
+        (ping_pong)      ? reg_fmap_b_base :
+                           reg_fmap_a_base;
+
+    wire [31:0] cur_ofmap_base = 
+        (layer_idx == 11) ? reg_out_base :
+        (ping_pong)       ? reg_fmap_a_base :
+                            reg_fmap_b_base;
+
+    reg  conv_start_r;
+    wire conv_done_w;
+
+    wire [11:0] current_c_out;
+    wire signed [DW-1:0] current_bias = bias_mem[cfg_bias_base + current_c_out];
+
+    conv_unified #(.DW(DW),.ACC_W(ACC_W),.FRAC_W(FRAC_W)) u_CONV_CORE (
+        .clk(clk), .rst_n(rst_n), .start(conv_start_r), .done(conv_done_w),
+        
+        // AXI4 Master
+        .m_axi_araddr(m_axi_araddr), .m_axi_arlen(m_axi_arlen),
+        .m_axi_arsize(m_axi_arsize), .m_axi_arburst(m_axi_arburst),
+        .m_axi_arvalid(m_axi_arvalid), .m_axi_arready(m_axi_arready),
+        .m_axi_rdata(m_axi_rdata), .m_axi_rresp(m_axi_rresp),
+        .m_axi_rlast(m_axi_rlast), .m_axi_rvalid(m_axi_rvalid),
+        .m_axi_rready(m_axi_rready),
+
+        .m_axi_awaddr(m_axi_awaddr), .m_axi_awlen(m_axi_awlen),
+        .m_axi_awsize(m_axi_awsize), .m_axi_awburst(m_axi_awburst),
+        .m_axi_awvalid(m_axi_awvalid), .m_axi_awready(m_axi_awready),
+        .m_axi_wdata(m_axi_wdata), .m_axi_wstrb(m_axi_wstrb),
+        .m_axi_wlast(m_axi_wlast), .m_axi_wvalid(m_axi_wvalid),
+        .m_axi_wready(m_axi_wready), .m_axi_bresp(m_axi_bresp),
+        .m_axi_bvalid(m_axi_bvalid), .m_axi_bready(m_axi_bready),
+
+        // Config
+        .cfg_h_in(cfg_h_in), .cfg_w_in(cfg_w_in),
+        .cfg_h_out(cfg_h_out), .cfg_w_out(cfg_w_out),
+        .cfg_c_in(cfg_c_in), .cfg_c_out(cfg_c_out),
+        .cfg_k(cfg_k), .cfg_stride(cfg_stride), .cfg_pad(cfg_pad),
+        .cfg_mode(cfg_mode), .cfg_weight_base(cfg_weight_base),
+        .cfg_ifmap_base(cur_ifmap_base), .cfg_ofmap_base(cur_ofmap_base),
+        .reg_weight_base(reg_weight_base),
+        .cur_act(cur_act),
+        
+        .bias_val(current_bias),
+        .current_c_out(current_c_out)
+    );
+
+    reg [11:0] target_bias_base;
+
+    always @(*) begin
+        case (wr_layer)
+            4'd0:  target_bias_base=12'd0;
+            4'd1:  target_bias_base=12'd32;
+            4'd2:  target_bias_base=12'd96;
+            4'd3:  target_bias_base=12'd224;
+            4'd4:  target_bias_base=12'd480;
+            4'd5:  target_bias_base=12'd992;
+            4'd6:  target_bias_base=12'd1504;
+            4'd7:  target_bias_base=12'd1760;
+            4'd8:  target_bias_base=12'd1888;
+            4'd9:  target_bias_base=12'd1952;
+            4'd10: target_bias_base=12'd1984;
+            4'd11: target_bias_base=12'd2016;
+            default: target_bias_base=12'd0;
+        endcase
+    end
+
+    always @(posedge clk) begin
+        if (wr_en && wr_type == 2'd3) begin
+            bias_mem[target_bias_base + wr_addr[11:0]] <= wr_data;
+        end
+    end
+
+    task set_layer_info;
+        input [3:0] idx;
+        begin
+            case (idx)
+                4'd0:  begin cfg_c_in=12'd3;   cfg_c_out=12'd32;  cfg_h_in=10'd64; cfg_w_in=10'd64; cfg_h_out=10'd32; cfg_w_out=10'd32; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd0;       cur_act=2'd0; cfg_bias_base=12'd0;    end
+                4'd1:  begin cfg_c_in=12'd32;  cfg_c_out=12'd64;  cfg_h_in=10'd32; cfg_w_in=10'd32; cfg_h_out=10'd16; cfg_w_out=10'd16; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd3072;    cur_act=2'd0; cfg_bias_base=12'd32;   end
+                4'd2:  begin cfg_c_in=12'd64;  cfg_c_out=12'd128; cfg_h_in=10'd16; cfg_w_in=10'd16; cfg_h_out=10'd8;  cfg_w_out=10'd8;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd68608;   cur_act=2'd0; cfg_bias_base=12'd96;   end
+                4'd3:  begin cfg_c_in=12'd128; cfg_c_out=12'd256; cfg_h_in=10'd8;  cfg_w_in=10'd8;  cfg_h_out=10'd4;  cfg_w_out=10'd4;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd199680;  cur_act=2'd0; cfg_bias_base=12'd224;  end
+                4'd4:  begin cfg_c_in=12'd256; cfg_c_out=12'd512; cfg_h_in=10'd4;  cfg_w_in=10'd4;  cfg_h_out=10'd2;  cfg_w_out=10'd2;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd723968;  cur_act=2'd0; cfg_bias_base=12'd480;  end
+                4'd5:  begin cfg_c_in=12'd512; cfg_c_out=12'd512; cfg_h_in=10'd2;  cfg_w_in=10'd2;  cfg_h_out=10'd2;  cfg_w_out=10'd2;  cfg_k=4'd1; cfg_stride=4'd1; cfg_pad=4'd0; cfg_mode=1'b0; cfg_weight_base=26'd2821120; cur_act=2'd3; cfg_bias_base=12'd992;  end
+                4'd6:  begin cfg_c_in=12'd512; cfg_c_out=12'd256; cfg_h_in=10'd2;  cfg_w_in=10'd2;  cfg_h_out=10'd4;  cfg_w_out=10'd4;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd3083264; cur_act=2'd1; cfg_bias_base=12'd1504; end
+                4'd7:  begin cfg_c_in=12'd256; cfg_c_out=12'd128; cfg_h_in=10'd4;  cfg_w_in=10'd4;  cfg_h_out=10'd8;  cfg_w_out=10'd8;  cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5180672; cur_act=2'd1; cfg_bias_base=12'd1760; end
+                4'd8:  begin cfg_c_in=12'd128; cfg_c_out=12'd64;  cfg_h_in=10'd8;  cfg_w_in=10'd8;  cfg_h_out=10'd16; cfg_w_out=10'd16; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5705088; cur_act=2'd1; cfg_bias_base=12'd1888; end
+                4'd9:  begin cfg_c_in=12'd64;  cfg_c_out=12'd32;  cfg_h_in=10'd16; cfg_w_in=10'd16; cfg_h_out=10'd32; cfg_w_out=10'd32; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5836288; cur_act=2'd1; cfg_bias_base=12'd1952; end
+                4'd10: begin cfg_c_in=12'd32;  cfg_c_out=12'd32;  cfg_h_in=10'd32; cfg_w_in=10'd32; cfg_h_out=10'd64; cfg_w_out=10'd64; cfg_k=4'd4; cfg_stride=4'd2; cfg_pad=4'd1; cfg_mode=1'b1; cfg_weight_base=26'd5869088; cur_act=2'd1; cfg_bias_base=12'd1984; end
+                4'd11: begin cfg_c_in=12'd32;  cfg_c_out=12'd3;   cfg_h_in=10'd64; cfg_w_in=10'd64; cfg_h_out=10'd64; cfg_w_out=10'd64; cfg_k=4'd3; cfg_stride=4'd1; cfg_pad=4'd1; cfg_mode=1'b0; cfg_weight_base=26'd5901888; cur_act=2'd2; cfg_bias_base=12'd2016; end
+                default: begin cfg_c_in=12'd0; cfg_c_out=12'd0; cfg_h_in=10'd0; cfg_w_in=10'd0; cfg_h_out=10'd0; cfg_w_out=10'd0; cfg_k=4'd0; cfg_stride=4'd0; cfg_pad=4'd0; cfg_mode=1'b0; cfg_weight_base=26'd0; cur_act=2'd3; cfg_bias_base=12'd0; end
+            endcase
+            cur_c_out = cfg_c_out;
+            cur_h_out = cfg_h_out;
+            cur_w_out = cfg_w_out;
+        end
+    endtask
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            state <= ST_IDLE;
+            done <= 0; layer_idx <= 0;
+            ping_pong <= 0; conv_start_r <= 0;
+        end else begin
+            done         <= 0;
+            conv_start_r <= 0;
+
+            case (state)
+            ST_IDLE: begin
+                if (start) begin
+                    layer_idx <= 4'd0; ping_pong <= 0;
+                    set_layer_info(4'd0);
+                    state  <= ST_CONV_START;
+                    $display("[TOP] Inference start (AXI mode)");
+                end
+            end
+
+            ST_CONV_START: begin
+                conv_start_r <= 1'b1;
+                state        <= ST_CONV_WAIT;
+            end
+
+            ST_CONV_WAIT: begin
+                if (conv_done_w) begin
+                    state <= ST_NEXT_LAYER;
+                end
+            end
+
+            ST_NEXT_LAYER: begin
+                if (layer_idx == 4'd11) begin
+                    state  <= ST_DONE;
+                end else begin
+                    ping_pong <= ~ping_pong;
+                    layer_idx <= layer_idx + 1;
+                    set_layer_info(layer_idx + 1);
+                    state  <= ST_CONV_START;
+                    $display("[TOP] Next layer %0d", layer_idx + 1);
+                end
+            end
+
+            ST_DONE: begin
+                done  <= 1'b1;
+                state <= ST_IDLE;
+                $display("[TOP] Inference complete.");
+            end
+            endcase
+        end
+    end
+
+endmodule
+`default_nettype wire
+
+
+// =============================================================================
+// conv_unified (AXI4 Master, Per-Pixel Tile Strategy)
+// =============================================================================
+`timescale 1ns/1ps
+`default_nettype none
+
+module conv_unified #(
+    parameter DW    = 16,
+    parameter ACC_W = 48,
+    parameter FRAC_W = 8
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,
+    output reg  done,
+
+    // ---------------------------------------------------
+    // AXI4 Master Interface
+    // ---------------------------------------------------
+    output reg  [31:0] m_axi_araddr,
+    output reg  [7:0]  m_axi_arlen,
+    output reg  [2:0]  m_axi_arsize,
+    output reg  [1:0]  m_axi_arburst,
+    output reg         m_axi_arvalid,
+    input  wire        m_axi_arready,
+    input  wire [31:0] m_axi_rdata,
+    input  wire [1:0]  m_axi_rresp,
+    input  wire        m_axi_rlast,
+    input  wire        m_axi_rvalid,
+    output reg         m_axi_rready,
+
+    output reg  [31:0] m_axi_awaddr,
+    output reg  [7:0]  m_axi_awlen,
+    output reg  [2:0]  m_axi_awsize,
+    output reg  [1:0]  m_axi_awburst,
+    output reg         m_axi_awvalid,
+    input  wire        m_axi_awready,
+    output reg  [31:0] m_axi_wdata,
+    output reg  [3:0]  m_axi_wstrb,
+    output reg         m_axi_wlast,
+    output reg         m_axi_wvalid,
+    input  wire        m_axi_wready,
+    input  wire [1:0]  m_axi_bresp,
+    input  wire        m_axi_bvalid,
+    output reg         m_axi_bready,
+
+    // ---------------------------------------------------
+    // Configuration
+    // ---------------------------------------------------
+    input  wire [9:0]  cfg_h_in,  cfg_w_in,
+    input  wire [9:0]  cfg_h_out, cfg_w_out,
+    input  wire [11:0] cfg_c_in,  cfg_c_out,
+    input  wire [3:0]  cfg_k, cfg_stride, cfg_pad,
+    input  wire        cfg_mode,
+    input  wire [25:0] cfg_weight_base,
+    input  wire [31:0] cfg_ifmap_base,
+    input  wire [31:0] cfg_ofmap_base,
+    input  wire [31:0] reg_weight_base,
+
+    input  wire signed [DW-1:0] bias_val,
+    output wire [11:0]          current_c_out,
+
+    // Activation selection
+    input  wire [1:0]           cur_act // 0: LReLU, 1: ReLU, 2: Tanh, 3: None
+);
+
+    localparam N_MAC = 16;
+    localparam FRAC_W_LOCAL = FRAC_W;
+
+    // ---------------------------------------------------
+    // Tile Buffers (BRAM) - Stores exactly 1 patch
+    // ---------------------------------------------------
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_0 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_1 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_2 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_3 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_4 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_5 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_6 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_7 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_8 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_9 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_10 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_11 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_12 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_13 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_14 [0:511];
+    (* ram_style = "block" *) reg signed [15:0] weight_cache_15 [0:511];
+
+    reg signed [DW-1:0] weight_tile [0:15];
+    reg signed [DW-1:0] ifmap_tile  [0:15];
+    reg signed [ACC_W-1:0] acc_reg;
+
+    reg [11:0] c_out_cnt, c_in_cnt, fill_c_in_cnt;
+    reg [9:0]  h_cnt, w_cnt;
+    reg [4:0]  wc;       // weight-word counter (0..k*k-1) during weight fill
+    reg [4:0]  tap_cnt;  // ifmap tap counter (0..15) during ifmap gather (transpose path)
+    reg [2:0]  fr;       // [STEP2] fetch-row counter (0..k-1) for conv2d row-burst
+    reg [4:0]  beat_cnt; // [STEP2] beat index within a row-burst
+    reg        ph;       // [HW-SAFE] half phase within a 4-byte beat (0=low,1=high)
+    assign current_c_out = c_out_cnt;
+
+    // ---------------------------------------------------
+    // FSM State Definitions
+    // ---------------------------------------------------
+    localparam ST_IDLE          = 4'd0;
+    localparam ST_FILL_W_AR     = 4'd1;
+    localparam ST_FILL_W_R      = 4'd2;
+    localparam ST_FETCH_I_AR    = 4'd3;
+    localparam ST_FETCH_I_R     = 4'd4;
+    localparam ST_COMPUTE_ISSUE = 4'd5;
+    localparam ST_WB_AW         = 4'd6;
+    localparam ST_WB_W          = 4'd7;
+    localparam ST_WB_B          = 4'd8;
+    localparam ST_COMPUTE_WAIT  = 4'd9;
+    localparam ST_FILL_W_SETUP  = 4'd10;
+    localparam ST_FETCH_I_SETUP = 4'd11;
+
+    reg [3:0] state;
+
+    // ---------------------------------------------------
+    // Address Generator (Combinational)
+    // ---------------------------------------------------
+    wire [N_MAC*18-1:0] ifmap_addrs_w;
+    wire [N_MAC*26-1:0] weight_addrs_w;
+    wire [N_MAC-1:0]    valid_vec_w;
+
+    // ST_FILL_W_SETUP also uses fill_c_in_cnt so addr_gen sees correct c_in
+    // while weight_addrs_r is being registered (1 cycle before ST_FILL_W_AR).
+    wire [11:0] effective_c_in = (state == ST_FILL_W_SETUP || state == ST_FILL_W_AR || state == ST_FILL_W_R) ? fill_c_in_cnt : c_in_cnt;
+
+    addr_gen u_addr_gen (
+        .c_out(c_out_cnt), .c_in(effective_c_in), .h_out(h_cnt), .w_out(w_cnt),
+        .cfg_h_in(cfg_h_in), .cfg_w_in(cfg_w_in),
+        .cfg_c_in(cfg_c_in), .cfg_c_out(cfg_c_out),
+        .cfg_k(cfg_k), .cfg_stride(cfg_stride), .cfg_pad(cfg_pad),
+        .cfg_mode(cfg_mode), .cfg_weight_base(cfg_weight_base),
+        .ifmap_addrs(ifmap_addrs_w), .weight_addrs(weight_addrs_w),
+        .valid_vec(valid_vec_w)
+    );
+
+    // -----------------------------------------------------------------------
+    // [ADDR-GEN PIPELINE] Registered addr_gen outputs
+    // Captured in SETUP states (1 cycle before AR states) to break the
+    // critical path: cfg_* -> addr_gen (comb.) -> burst_calc -> m_axi_arlen.
+    // After this register, each sub-path is approximately half the original.
+    // -----------------------------------------------------------------------
+    reg [N_MAC*26-1:0] weight_addrs_r;
+    reg [N_MAC*18-1:0] ifmap_addrs_r;
+    reg [N_MAC-1:0]    valid_vec_r;
+
+    always @(posedge clk) begin
+        weight_addrs_r <= weight_addrs_w;
+        ifmap_addrs_r  <= ifmap_addrs_w;
+        valid_vec_r    <= valid_vec_w;
+    end
+
+    wire [4:0]  kk_local   = cfg_k * cfg_k;                       // taps per kernel (<=16)
+
+    // =======================================================================
+    // [HW-SAFE BURST] All ifmap/weight reads use FULL-WIDTH 4-byte beats
+    // (arsize=010, INCR, 4-byte-aligned start) — safe for the Zynq AXI
+    // interconnect (no narrow bursts). Each beat carries TWO 16-bit elements:
+    //   rdata[15:0]  = even element,  rdata[31:16] = odd element.
+    // We consume ONE element per cycle across two phases (ph=0 low half,
+    // ph=1 high half) so a single demux suffices, and only advance the AXI
+    // beat (rready) on the high phase. A run of N contiguous elements starting
+    // at element e0 spans nbeats = ceil((e0[0]+N)/2) beats; element e0+pos lands
+    // in beat (e0[0]+pos)/2, half (e0[0]+pos)&1.
+    // =======================================================================
+
+    // ---- WEIGHT run: whole kernel (kk contiguous elems) from w_addr0 ----
+    wire [25:0] w_addr0  = weight_addrs_w[0 +: 26];      // tap-0 weight element
+    wire        w_off    = w_addr0[0];                   // start offset in first word
+    wire [25:0] w_ealign = {w_addr0[25:1], 1'b0};        // 4-byte-aligned start elem
+    wire [4:0]  w_nbeats = ({4'b0, w_off} + kk_local + 5'd1) >> 1; // ceil((off+kk)/2)
+    wire [5:0]  w_pos    = ph ? ({wc, 1'b0} - {5'b0, w_off} + 6'd1)  // hi: 2*wc-off+1
+                              : ({wc, 1'b0} - {5'b0, w_off});        // lo: 2*wc-off
+    wire        w_lo_under = (w_off & (wc == 5'd0));     // 2*wc<off only at wc=0,off=1
+    wire        w_pos_vld  = (ph ? 1'b1 : ~w_lo_under) && (w_pos < {1'b0, kk_local});
+    wire signed [15:0] w_half = ph ? m_axi_rdata[31:16] : m_axi_rdata[15:0];
+
+    // -----------------------------------------------------------------------
+    // [STEP2/3] Per-kernel-row ifmap burst (both conv2d & transpose).
+    // Within kernel row `fr` the VALID taps map to a CONTIGUOUS run of ifmap
+    // elements (addresses +1 per element). Invalid tile slots are masked by
+    // valid_vec in the MAC -> no zeroing needed.
+    //   conv2d (mode0): valid dx contiguous & in order. base = first valid dx;
+    //                   run-pos p -> slot = base_tap + p.
+    //   transpose (mode1): valid dx strided & REVERSED but ifmap_x consecutive.
+    //                   base = LAST valid dx (lowest addr); run-pos p ->
+    //                   slot = base_tap - p*stride.
+    // -----------------------------------------------------------------------
+    wire [4:0] row_t0 = fr * cfg_k;                 // first tap index of row fr
+    wire rvb0 =                  valid_vec_w[row_t0 + 5'd0];
+    wire rvb1 = (cfg_k > 4'd1) ? valid_vec_w[row_t0 + 5'd1] : 1'b0;
+    wire rvb2 = (cfg_k > 4'd2) ? valid_vec_w[row_t0 + 5'd2] : 1'b0;
+    wire rvb3 = (cfg_k > 4'd3) ? valid_vec_w[row_t0 + 5'd3] : 1'b0;
+    wire       row_any     = rvb0 | rvb1 | rvb2 | rvb3;
+    wire [2:0] row_dx_first = rvb0 ? 3'd0 : rvb1 ? 3'd1 : rvb2 ? 3'd2 : 3'd3; // min valid dx
+    wire [2:0] row_dx_last  = rvb3 ? 3'd3 : rvb2 ? 3'd2 : rvb1 ? 3'd1 : 3'd0; // max valid dx
+    wire [2:0] row_base_dx  = (cfg_mode == 1'b0) ? row_dx_first : row_dx_last;
+    wire [2:0] row_cnt      = {2'b0,rvb0} + {2'b0,rvb1} + {2'b0,rvb2} + {2'b0,rvb3}; // #valid elems
+    wire [4:0] row_base_tap = row_t0 + {2'b0,row_base_dx};      // tile slot of burst base tap
+    wire [17:0] row_base_addr = ifmap_addrs_w[row_base_tap*18 +: 18]; // lowest address of the run
+
+    wire        i_off    = row_base_addr[0];
+    wire [17:0] i_ealign = {row_base_addr[17:1], 1'b0};
+    wire [4:0]  i_nbeats = ({4'b0, i_off} + {2'b0, row_cnt} + 5'd1) >> 1; // ceil((off+cnt)/2)
+    wire [5:0]  i_pos    = ph ? ({beat_cnt, 1'b0} - {5'b0, i_off} + 6'd1)
+                              : ({beat_cnt, 1'b0} - {5'b0, i_off});
+    wire        i_lo_under = (i_off & (beat_cnt == 5'd0));
+    wire        i_pos_vld  = (ph ? 1'b1 : ~i_lo_under) && (i_pos < {3'b0, row_cnt});
+    wire signed [15:0] i_half = ph ? m_axi_rdata[31:16] : m_axi_rdata[15:0];
+    wire [5:0]  i_pos_x_str = i_pos[4:0] * cfg_stride;
+    wire [4:0]  i_burst_slot = (cfg_mode == 1'b0)
+                             ? (row_base_tap + i_pos[4:0])
+                             : (row_base_tap - i_pos_x_str[4:0]);
+
+    // -----------------------------------------------------------------------
+    // [AXI-SAFE] 4KB Boundary Crossing Prevention Logic
+    // AMBA AXI4 protocol forbids INCR bursts from crossing a 4KB (0x1000) page
+    // boundary. We calculate the remaining beats in the current 4KB page and
+    // clamp the burst length (arlen) accordingly.
+    // -----------------------------------------------------------------------
+    wire [31:0] w_base_byte   = reg_weight_base + ({6'b0, w_ealign} << 1);
+    wire [31:0] w_cur_addr    = w_base_byte + ({26'b0, wc} << 2);
+    wire [4:0]  w_rem_beats   = w_nbeats - wc;
+    wire [10:0] w_page_beats  = 11'd1024 - {1'b0, w_cur_addr[11:2]};
+    wire [4:0]  w_burst_beats = ({6'b0, w_rem_beats} <= w_page_beats) ? w_rem_beats : w_page_beats[4:0];
+
+    wire [31:0] i_base_byte   = cfg_ifmap_base + ({14'b0, i_ealign} << 1);
+    wire [31:0] i_cur_addr    = i_base_byte + ({26'b0, beat_cnt} << 2);
+    wire [4:0]  i_rem_beats   = i_nbeats - beat_cnt;
+    wire [10:0] i_page_beats  = 11'd1024 - {1'b0, i_cur_addr[11:2]};
+    wire [4:0]  i_burst_beats = ({6'b0, i_rem_beats} <= i_page_beats) ? i_rem_beats : i_page_beats[4:0];
+
+    // -----------------------------------------------------------------------
+    // [ADDR-GEN PIPELINE] Registered-base burst signals
+    // Derived from weight_addrs_r / ifmap_addrs_r / valid_vec_r.
+    // Used exclusively in _AR states so the path from the register to
+    // m_axi_arlen_reg is short. The _R states continue to use the
+    // combinational versions (non-critical for timing).
+    // -----------------------------------------------------------------------
+    // --- Weight side ---
+    wire [25:0] w_addr0_r      = weight_addrs_r[0 +: 26];
+    wire        w_off_r        = w_addr0_r[0];
+    wire [25:0] w_ealign_r     = {w_addr0_r[25:1], 1'b0};
+    wire [4:0]  w_nbeats_r     = ({4'b0, w_off_r} + kk_local + 5'd1) >> 1;
+    wire [31:0] w_base_byte_r  = reg_weight_base + ({6'b0, w_ealign_r} << 1);
+    wire [31:0] w_cur_addr_r   = w_base_byte_r + ({26'b0, wc} << 2);
+    wire [4:0]  w_rem_beats_r  = w_nbeats_r - wc;
+    wire [10:0] w_page_beats_r = 11'd1024 - {1'b0, w_cur_addr_r[11:2]};
+    wire [4:0]  w_burst_beats_r = ({6'b0, w_rem_beats_r} <= w_page_beats_r) ? w_rem_beats_r : w_page_beats_r[4:0];
+
+    // --- Ifmap side ---
+    wire        rvb0_r = valid_vec_r[row_t0 + 5'd0];
+    wire        rvb1_r = (cfg_k > 4'd1) ? valid_vec_r[row_t0 + 5'd1] : 1'b0;
+    wire        rvb2_r = (cfg_k > 4'd2) ? valid_vec_r[row_t0 + 5'd2] : 1'b0;
+    wire        rvb3_r = (cfg_k > 4'd3) ? valid_vec_r[row_t0 + 5'd3] : 1'b0;
+    wire        row_any_r      = rvb0_r | rvb1_r | rvb2_r | rvb3_r;
+    wire [2:0]  row_dx_first_r = rvb0_r ? 3'd0 : rvb1_r ? 3'd1 : rvb2_r ? 3'd2 : 3'd3;
+    wire [2:0]  row_dx_last_r  = rvb3_r ? 3'd3 : rvb2_r ? 3'd2 : rvb1_r ? 3'd1 : 3'd0;
+    wire [2:0]  row_base_dx_r  = (cfg_mode == 1'b0) ? row_dx_first_r : row_dx_last_r;
+    wire [2:0]  row_cnt_r      = {2'b0,rvb0_r} + {2'b0,rvb1_r} + {2'b0,rvb2_r} + {2'b0,rvb3_r};
+    wire [4:0]  row_base_tap_r = row_t0 + {2'b0, row_base_dx_r};
+    wire [17:0] row_base_addr_r = ifmap_addrs_r[row_base_tap_r * 18 +: 18];
+    wire        i_off_r        = row_base_addr_r[0];
+    wire [17:0] i_ealign_r     = {row_base_addr_r[17:1], 1'b0};
+    wire [4:0]  i_nbeats_r     = ({4'b0, i_off_r} + {2'b0, row_cnt_r} + 5'd1) >> 1;
+    wire [31:0] i_base_byte_r  = cfg_ifmap_base + ({14'b0, i_ealign_r} << 1);
+    wire [31:0] i_cur_addr_r   = i_base_byte_r + ({26'b0, beat_cnt} << 2);
+    wire [4:0]  i_rem_beats_r  = i_nbeats_r - beat_cnt;
+    wire [10:0] i_page_beats_r = 11'd1024 - {1'b0, i_cur_addr_r[11:2]};
+    wire [4:0]  i_burst_beats_r = ({6'b0, i_rem_beats_r} <= i_page_beats_r) ? i_rem_beats_r : i_page_beats_r[4:0];
+
+    // ---------------------------------------------------
+    // Weight cache write (one element/cycle, demuxed by run-position) + read
+    // ---------------------------------------------------
+    wire we_weight = (state == ST_FILL_W_R && m_axi_rvalid && w_pos_vld);
+
+    always @(posedge clk) begin
+        if (we_weight) begin
+            case (w_pos[3:0])
+                4'd0:  weight_cache_0 [fill_c_in_cnt] <= w_half;
+                4'd1:  weight_cache_1 [fill_c_in_cnt] <= w_half;
+                4'd2:  weight_cache_2 [fill_c_in_cnt] <= w_half;
+                4'd3:  weight_cache_3 [fill_c_in_cnt] <= w_half;
+                4'd4:  weight_cache_4 [fill_c_in_cnt] <= w_half;
+                4'd5:  weight_cache_5 [fill_c_in_cnt] <= w_half;
+                4'd6:  weight_cache_6 [fill_c_in_cnt] <= w_half;
+                4'd7:  weight_cache_7 [fill_c_in_cnt] <= w_half;
+                4'd8:  weight_cache_8 [fill_c_in_cnt] <= w_half;
+                4'd9:  weight_cache_9 [fill_c_in_cnt] <= w_half;
+                4'd10: weight_cache_10[fill_c_in_cnt] <= w_half;
+                4'd11: weight_cache_11[fill_c_in_cnt] <= w_half;
+                4'd12: weight_cache_12[fill_c_in_cnt] <= w_half;
+                4'd13: weight_cache_13[fill_c_in_cnt] <= w_half;
+                4'd14: weight_cache_14[fill_c_in_cnt] <= w_half;
+                4'd15: weight_cache_15[fill_c_in_cnt] <= w_half;
+                default: ;
+            endcase
+        end
+        weight_tile[0]  <= weight_cache_0 [c_in_cnt];
+        weight_tile[1]  <= weight_cache_1 [c_in_cnt];
+        weight_tile[2]  <= weight_cache_2 [c_in_cnt];
+        weight_tile[3]  <= weight_cache_3 [c_in_cnt];
+        weight_tile[4]  <= weight_cache_4 [c_in_cnt];
+        weight_tile[5]  <= weight_cache_5 [c_in_cnt];
+        weight_tile[6]  <= weight_cache_6 [c_in_cnt];
+        weight_tile[7]  <= weight_cache_7 [c_in_cnt];
+        weight_tile[8]  <= weight_cache_8 [c_in_cnt];
+        weight_tile[9]  <= weight_cache_9 [c_in_cnt];
+        weight_tile[10] <= weight_cache_10[c_in_cnt];
+        weight_tile[11] <= weight_cache_11[c_in_cnt];
+        weight_tile[12] <= weight_cache_12[c_in_cnt];
+        weight_tile[13] <= weight_cache_13[c_in_cnt];
+        weight_tile[14] <= weight_cache_14[c_in_cnt];
+        weight_tile[15] <= weight_cache_15[c_in_cnt];
+    end
+
+    // MAC Array
+    wire [N_MAC*DW-1:0] weight_vec, ifmap_vec;
+    genvar t;
+    generate
+        for (t = 0; t < N_MAC; t = t + 1) begin : MAC_MAP
+            assign weight_vec[t*DW +: DW] = weight_tile[t];
+            assign ifmap_vec [t*DW +: DW] = ifmap_tile[t];
+        end
+    endgenerate
+
+    localparam MAC_PIPE = 2; // must match PIPE_STAGES in mac_array.v
+
+    wire signed [ACC_W-1:0] row_sum;
+    wire mac_out_valid;
+    // in_valid: pulse high for exactly 1 cycle when weight_tile/ifmap_tile are stable
+    wire mac_in_valid = (state == ST_COMPUTE_ISSUE);
+
+    mac_array #(.DW(DW), .ACC_W(ACC_W), .K(4), .PIPE_STAGES(MAC_PIPE)) u_mac_array (
+        .clk        (clk),
+        .weight_vec (weight_vec),
+        .ifmap_vec  (ifmap_vec),
+        .valid_vec  (valid_vec_w),
+        .in_valid   (mac_in_valid),
+        .sum_out    (row_sum),
+        .out_valid  (mac_out_valid)
+    );
+
+    // Bias logic
+    wire is_first = (c_in_cnt == 12'd0);
+    wire is_last  = (cfg_c_in > 0) && (c_in_cnt == cfg_c_in - 1);
+    wire all_done = is_last &&
+                   (w_cnt     == cfg_w_out - 1) &&
+                   (h_cnt     == cfg_h_out - 1) &&
+                   (c_out_cnt == cfg_c_out - 1);
+
+    wire signed [ACC_W-1:0] bias_extended =
+        {{(ACC_W-DW){bias_val[DW-1]}}, bias_val} <<< FRAC_W_LOCAL;
+    wire signed [ACC_W-1:0] acc_next =
+        is_first ? (bias_extended + row_sum) : (acc_reg + row_sum);
+
+    // Activations
+    // [FIX-A] Writeback must use acc_reg (the fully-accumulated sum latched at the
+    // last ST_COMPUTE), NOT acc_next. In the writeback states acc_next = acc_reg +
+    // row_sum, which would re-add the last input channel's contribution (double-count).
+    wire signed [ACC_W-1:0] acc_rounded  = acc_reg + (48'sd1 << (FRAC_W_LOCAL-1));
+    wire signed [ACC_W-FRAC_W_LOCAL-1:0] acc_shifted = acc_rounded[ACC_W-1:FRAC_W_LOCAL];
+
+    localparam signed [DW-1:0] SAT_MAX = 16'sh7FFF;
+    localparam signed [DW-1:0] SAT_MIN = 16'sh8000;
+    wire sat_pos = ($signed(acc_shifted) >  $signed(40'sd32767));
+    wire sat_neg = ($signed(acc_shifted) < -$signed(40'sd32768));
+    wire signed [DW-1:0] acc_trunc = sat_pos ? SAT_MAX : (sat_neg ? SAT_MIN : acc_shifted[DW-1:0]);
+
+    wire signed [DW-1:0] lrelu_out, relu_out, tanh_out_w;
+    wire lrelu_valid, relu_valid, tanh_valid;
+
+    leaky_relu #(.DW(DW),.FRAC_W(FRAC_W_LOCAL)) u_lrelu (
+        .valid_in(1'b1), .x_in(acc_trunc),
+        .valid_out(lrelu_valid), .y_out(lrelu_out));
+    relu #(.DW(DW)) u_relu (
+        .valid_in(1'b1), .x_in(acc_trunc),
+        .valid_out(relu_valid),  .y_out(relu_out));
+    tanh_act #(.DW(DW),.FRAC_W(FRAC_W_LOCAL)) u_tanh (
+        .clk(clk), .valid_in(1'b1), .x_in(acc_trunc),
+        .valid_out(tanh_valid), .y_out(tanh_out_w));
+
+    wire signed [DW-1:0] final_pixel =
+        (cur_act == 2'd0) ? lrelu_out :
+        (cur_act == 2'd1) ? relu_out :
+        (cur_act == 2'd2) ? tanh_out_w : acc_trunc;
+
+    wire [19:0] hw_out            = {10'b0, cfg_h_out} * {10'b0, cfg_w_out};
+    wire [31:0] ofmap_word_offset = {20'b0, c_out_cnt} * {12'b0, hw_out} + {22'b0, h_cnt} * {22'b0, cfg_w_out} + {22'b0, w_cnt};
+    wire [31:0] ofmap_byte_addr   = cfg_ofmap_base + (ofmap_word_offset << 1);
+
+    // ---------------------------------------------------
+    // FSM
+    // ---------------------------------------------------
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            state <= ST_IDLE;
+            done  <= 0;
+            c_out_cnt <= 0; h_cnt <= 0; w_cnt <= 0; c_in_cnt <= 0;
+            fill_c_in_cnt <= 0; wc <= 0; tap_cnt <= 0;
+            fr <= 0; beat_cnt <= 0; ph <= 0;
+            m_axi_arvalid <= 0; m_axi_rready <= 0;
+            m_axi_awvalid <= 0; m_axi_wvalid <= 0; m_axi_bready <= 0;
+            acc_reg <= 0;
+        end else begin
+            done <= 0;
+            case (state)
+                ST_IDLE: begin
+                    if (start) begin
+                        c_out_cnt <= 0; h_cnt <= 0; w_cnt <= 0; c_in_cnt <= 0;
+                        fill_c_in_cnt <= 0; wc <= 0; tap_cnt <= 0; fr <= 0;
+                        state <= ST_FILL_W_SETUP; // go through setup to register addr_gen outputs
+                    end
+                end
+
+                // --- FILL WEIGHT CACHE (one full-width burst per c_in) ---
+                // [HW-SAFE] Burst the whole kernel (kk contiguous elems) for this
+                // c_in. 4-byte-aligned start, arsize=010; two phases per beat.
+                // [PIPELINE] Use _r signals: path is weight_addrs_r (FF) -> burst_calc -> m_axi_arlen
+                // weight_addrs_r was captured in ST_FILL_W_SETUP (previous cycle).
+                ST_FILL_W_AR: begin
+                    m_axi_araddr  <= w_cur_addr_r;
+                    m_axi_arlen   <= {3'd0, (w_burst_beats_r - 5'd1)};
+                    m_axi_arsize  <= 3'b010;  // 4 bytes/beat (full width)
+                    m_axi_arburst <= 2'b01;   // INCR
+                    m_axi_arvalid <= 1'b1;
+                    if (m_axi_arvalid && m_axi_arready) begin
+                        m_axi_arvalid <= 1'b0;
+                        m_axi_rready  <= 1'b0;  // phase 0: read low half, do not advance
+                        ph            <= 1'b0;
+                        state         <= ST_FILL_W_R;
+                    end
+                end
+
+                ST_FILL_W_R: begin
+                    if (m_axi_rvalid) begin
+                        // we_weight writes the in-run element (w_pos) this cycle
+                        if (ph == 1'b0) begin
+                            ph           <= 1'b1;
+                            m_axi_rready <= 1'b1;  // advance the beat on the high phase
+                        end else begin
+                            ph           <= 1'b0;
+                            m_axi_rready <= 1'b0;
+                            if (m_axi_rlast) begin
+                                if (wc == w_nbeats - 5'd1) begin
+                                    wc <= 5'd0;
+                                    if (fill_c_in_cnt == cfg_c_in - 1) begin
+                                        fill_c_in_cnt <= 0;
+                                        tap_cnt       <= 0;
+                                        fr            <= 0;
+                                        beat_cnt      <= 0;
+                                        state         <= ST_FETCH_I_SETUP; // addr_gen -> ifmap_addrs_r
+                                    end else begin
+                                        fill_c_in_cnt <= fill_c_in_cnt + 1;
+                                        state         <= ST_FILL_W_SETUP;  // addr_gen -> weight_addrs_r
+                                    end
+                                end else begin
+                                    wc    <= wc + 5'd1;
+                                    state <= ST_FILL_W_SETUP;  // addr_gen -> weight_addrs_r
+                                end
+                            end else begin
+                                wc <= wc + 5'd1;   // next beat
+                            end
+                        end
+                    end
+                end
+
+                // --- FETCH IFMAP (per-kernel-row burst; conv2d & transpose) ---
+                // [STEP2/3] One burst per kernel row over the contiguous valid-tap
+                // run; the row_* helpers pick base/slot stepping per cfg_mode.
+                // [PIPELINE] row_any_r uses valid_vec_r (registered in SETUP), i_cur_addr_r
+                // and i_burst_beats_r break the cfg_* -> ifmap_addrs -> m_axi_arlen path.
+                // valid_vec_r contains the FULL K*K valid vector; indexing with current fr is safe.
+                ST_FETCH_I_AR: begin
+                    if (fr == cfg_k[2:0]) begin
+                        state <= ST_COMPUTE_ISSUE;
+                    end else if (!row_any_r) begin
+                        // whole row has no valid tap (padding / out-of-range): skip
+                        fr <= fr + 3'd1;
+                    end else begin
+                        m_axi_araddr  <= i_cur_addr_r;
+                        m_axi_arlen   <= {3'd0, (i_burst_beats_r - 5'd1)};
+                        m_axi_arsize  <= 3'b010;  // 4 bytes/beat (full width)
+                        m_axi_arburst <= 2'b01;
+                        m_axi_arvalid <= 1'b1;
+                        if (m_axi_arvalid && m_axi_arready) begin
+                            m_axi_arvalid <= 1'b0;
+                            m_axi_rready  <= 1'b0;  // phase 0: read low half, do not advance
+                            ph            <= 1'b0;
+                            state         <= ST_FETCH_I_R;
+                        end
+                    end
+                end
+
+                ST_FETCH_I_R: begin
+                    if (m_axi_rvalid) begin
+                        if (i_pos_vld) ifmap_tile[i_burst_slot[3:0]] <= i_half;
+                        if (ph == 1'b0) begin
+                            ph           <= 1'b1;
+                            m_axi_rready <= 1'b1;  // advance the beat on the high phase
+                        end else begin
+                            ph           <= 1'b0;
+                            m_axi_rready <= 1'b0;
+                            if (m_axi_rlast) begin
+                                if (beat_cnt == i_nbeats - 5'd1) begin
+                                    fr       <= fr + 3'd1;
+                                    beat_cnt <= 0;
+                                    state    <= ST_FETCH_I_SETUP; // re-register addr_gen for new fr
+                                end else begin
+                                    beat_cnt <= beat_cnt + 5'd1;
+                                    state    <= ST_FETCH_I_SETUP; // re-register for new beat_cnt
+                                end
+                            end else begin
+                                beat_cnt <= beat_cnt + 5'd1;
+                            end
+                        end
+                    end
+                end
+
+                // --- COMPUTE ISSUE: present data to MAC pipeline for 1 cycle ---
+                // mac_in_valid is driven combinationally (= state==ST_COMPUTE_ISSUE).
+                // At this clock edge: prod_reg in mac_array captures the products.
+                ST_COMPUTE_ISSUE: begin
+                    state <= ST_COMPUTE_WAIT;
+                end
+
+                // --- COMPUTE WAIT: drain pipeline, latch result when valid ---
+                // mac_out_valid asserts MAC_PIPE (=2) cycles after ISSUE.
+                // sum_out (= sum_out_reg in mac_array) is stable when mac_out_valid=1.
+                // Overhead vs original: +2 cycles per c_in — negligible vs DDR latency.
+                ST_COMPUTE_WAIT: begin
+                    if (mac_out_valid) begin
+                        acc_reg <= acc_next; // acc_next uses the now-valid row_sum
+                        if (is_last) begin
+                            state <= ST_WB_AW;
+                        end else begin
+                            c_in_cnt <= c_in_cnt + 1;
+                            tap_cnt  <= 0;
+                            fr       <= 0;
+                            beat_cnt <= 0;
+                            state    <= ST_FETCH_I_SETUP; // register addr_gen for next c_in
+                        end
+                    end
+                end
+
+                // --- ADDR-GEN PIPELINE SETUP STATES ---
+                // One cycle where addr_gen outputs (weight_addrs_w / ifmap_addrs_w /
+                // valid_vec_w) propagate into their registered counterparts (_r).
+                // The subsequent AR state uses the _r signals, making its path:
+                //   weight_addrs_r (FF) -> burst_calc -> m_axi_arlen_reg
+                // instead of:
+                //   cfg_* -> addr_gen -> burst_calc -> m_axi_arlen_reg  (was 27 ns!)
+                ST_FILL_W_SETUP: begin
+                    state <= ST_FILL_W_AR;
+                end
+
+                ST_FETCH_I_SETUP: begin
+                    state <= ST_FETCH_I_AR;
+                end
+
+                // --- WRITEBACK OFMAP (1 Beat) ---
+                ST_WB_AW: begin
+                    m_axi_awaddr  <= ofmap_byte_addr & 32'hFFFFFFFC; // Force 4-byte alignment
+                    m_axi_awlen   <= 8'd0;    // 1 beat
+                    m_axi_awsize  <= 3'b010;  // 4 bytes (FULL WIDTH burst to avoid narrow-burst bugs)
+                    m_axi_awburst <= 2'b01;   // INCR
+                    m_axi_awvalid <= 1'b1;
+
+                    // Prepare wdata, wstrb, and wlast NOW so they are ready when wvalid goes high
+                    if (ofmap_byte_addr & 2) begin
+                        m_axi_wdata  <= {final_pixel, 16'b0};
+                        m_axi_wstrb  <= 4'b1100;
+                    end else begin
+                        m_axi_wdata  <= {16'b0, final_pixel};
+                        m_axi_wstrb  <= 4'b0011;
+                    end
+                    m_axi_wlast  <= 1'b1;
+
+                    if (m_axi_awvalid && m_axi_awready) begin
+                        m_axi_awvalid <= 1'b0;
+                        m_axi_wvalid  <= 1'b1;
+                        state         <= ST_WB_W;
+                    end
+                end
+
+                ST_WB_W: begin
+                    // Data is already driven. Just wait for wready.
+                    if (m_axi_wvalid && m_axi_wready) begin
+                        m_axi_wvalid <= 1'b0;
+                        m_axi_wlast  <= 1'b0;
+                        m_axi_wstrb  <= 4'b0000;
+                        m_axi_bready <= 1'b1;
+                        state        <= ST_WB_B;
+                    end
+                end
+
+                ST_WB_B: begin
+                    if (m_axi_bvalid && m_axi_bready) begin
+                        m_axi_bready <= 1'b0;
+
+                        c_in_cnt <= 0;
+                        if (all_done) begin
+                            done  <= 1;
+                            state <= ST_IDLE;
+                        end else begin
+                            if (w_cnt == cfg_w_out - 1) begin
+                                w_cnt <= 0;
+                                if (h_cnt == cfg_h_out - 1) begin
+                                    h_cnt     <= 0;
+                                    c_out_cnt <= c_out_cnt + 1;
+                                    fill_c_in_cnt <= 0; // Trigger fill cache for next c_out
+                                end else begin
+                                    h_cnt <= h_cnt + 1;
+                                end
+                            end else begin
+                                w_cnt <= w_cnt + 1;
+                            end
+
+                            // If we just finished a c_out layer, refill the weight cache.
+                            if (w_cnt == cfg_w_out - 1 && h_cnt == cfg_h_out - 1) begin
+                                wc    <= 0;
+                                state <= ST_FILL_W_SETUP;  // addr_gen -> weight_addrs_r
+                            end else begin
+                                tap_cnt  <= 0;
+                                fr       <= 0;
+                                beat_cnt <= 0;
+                                state    <= ST_FETCH_I_SETUP; // addr_gen -> ifmap_addrs_r
+                            end
+                        end
+                    end
+                end
+            endcase
+        end
+    end
+endmodule
+`default_nettype wire
+
+
+
+// =============================================================================
+// mac_array.v  —  K*K Parallel MAC Array (with optional 2-stage pipeline)
+//
+// PIPE_STAGES parameter:
+//   0 = fully combinational (original behavior, backward compat)
+//   2 = 2-stage pipeline:
+//         Stage 1: register products after multiply   (cuts DSP critical path)
+//         Stage 2: register adder tree output         (cuts adder critical path)
+//       sum_out valid PIPE_STAGES clock cycles after in_valid is asserted.
+// =============================================================================
+`default_nettype none
+
+module mac_array #(
+    parameter DW          = 16,   // data width per element
+    parameter ACC_W       = 48,   // accumulator width
+    parameter K           = 4,    // kernel size (K*K MAC units)
+    parameter PIPE_STAGES = 2     // 0 = combinational, 2 = 2-stage pipeline
+)(
+    input  wire                     clk,         // required for pipeline registers
+    input  wire [K*K*DW-1:0]       weight_vec,
+    input  wire [K*K*DW-1:0]       ifmap_vec,
+    input  wire [K*K-1:0]          valid_vec,
+    input  wire                     in_valid,    // pulse 1 when inputs are stable
+    output wire signed [ACC_W-1:0]  sum_out,
+    output wire                     out_valid    // sum_out valid PIPE_STAGES cycles later
+);
+    localparam N_MAC = K * K;
+
+    // =========================================================================
+    // Stage 0: Combinational multiply (K*K parallel 16×16 signed multipliers)
+    // =========================================================================
+    wire signed [2*DW-1:0]  prod    [0:N_MAC-1];
+    wire signed [ACC_W-1:0] prod_sx [0:N_MAC-1]; // sign-extended to ACC_W
+
+    genvar m;
+    generate
+        for (m = 0; m < N_MAC; m = m + 1) begin : MUL
+            wire signed [DW-1:0] wval = weight_vec[m*DW +: DW];
+            // Zero out invalid taps (padding / out-of-range positions)
+            wire signed [DW-1:0] ival = valid_vec[m] ? ifmap_vec[m*DW +: DW]
+                                                     : {DW{1'b0}};
+
+            // [FIX] Cast to 2*DW BEFORE multiply to avoid truncation
+            wire signed [2*DW-1:0] wval_32 = $signed(wval);
+            wire signed [2*DW-1:0] ival_32 = $signed(ival);
+
+            assign prod[m]    = wval_32 * ival_32;
+            // Sign-extend 32-bit product to accumulator width
+            assign prod_sx[m] = {{(ACC_W - 2*DW){prod[m][2*DW-1]}}, prod[m]};
+        end
+    endgenerate
+
+    // =========================================================================
+    // Pipeline Stage 1: Register products after multiply
+    // Breaks the DSP multiply → adder-tree critical path into two shorter paths.
+    // When PIPE_STAGES==0, prod_reg is unused; synthesis will optimize it away.
+    // =========================================================================
+    reg signed [ACC_W-1:0] prod_reg [0:N_MAC-1];
+
+    genvar g;
+    generate
+        for (g = 0; g < N_MAC; g = g + 1) begin : STAGE1_REG
+            always @(posedge clk) begin
+                prod_reg[g] <= prod_sx[g];
+            end
+        end
+    endgenerate
+
+    // =========================================================================
+    // Flatten for adder tree:
+    //   PIPE_STAGES >= 1 → use registered products (prod_reg)
+    //   PIPE_STAGES == 0 → use combinational products (prod_sx), original path
+    // PIPE_STAGES is a compile-time constant; synthesis optimises away the mux.
+    // =========================================================================
+    wire [N_MAC*ACC_W-1:0] prod_flat;
+    genvar i;
+    generate
+        for (i = 0; i < N_MAC; i = i + 1) begin : FLAT
+            assign prod_flat[i*ACC_W +: ACC_W] =
+                (PIPE_STAGES >= 1) ? prod_reg[i] : prod_sx[i];
+        end
+    endgenerate
+
+    // =========================================================================
+    // Binary Adder Tree  (same recursive structure as before)
+    // =========================================================================
+    wire signed [ACC_W-1:0] tree_out;
+    adder_tree #(.W(ACC_W), .N(N_MAC)) u_adder_tree (
+        .in_vec (prod_flat),
+        .out_sum(tree_out)
+    );
+
+    // =========================================================================
+    // Pipeline Stage 2: Register adder-tree output
+    // When PIPE_STAGES < 2, sum_out_reg is unused; synthesis optimises it away.
+    // =========================================================================
+    reg signed [ACC_W-1:0] sum_out_reg;
+    always @(posedge clk) begin
+        sum_out_reg <= tree_out;
+    end
+
+    assign sum_out = (PIPE_STAGES >= 2) ? sum_out_reg : tree_out;
+
+    // =========================================================================
+    // Valid shift register — delays in_valid by PIPE_STAGES cycles
+    // =========================================================================
+    generate
+        if (PIPE_STAGES == 0) begin : COMB_VALID
+            // Combinational: no latency, out_valid mirrors in_valid
+            assign out_valid = in_valid;
+        end else if (PIPE_STAGES == 1) begin : PIPE1_VALID
+            reg valid_sr1;
+            always @(posedge clk) valid_sr1 <= in_valid;
+            assign out_valid = valid_sr1;
+        end else begin : PIPE2_VALID
+            // PIPE_STAGES >= 2: shift register of depth PIPE_STAGES
+            // in_valid enters at LSB, exits at MSB after PIPE_STAGES cycles
+            reg [PIPE_STAGES-1:0] valid_sr;
+            always @(posedge clk) begin
+                valid_sr <= {valid_sr[PIPE_STAGES-2:0], in_valid};
+            end
+            assign out_valid = valid_sr[PIPE_STAGES-1];
+        end
+    endgenerate
+
+endmodule
+
+// =============================================================================
+// adder_tree  —  Recursive Binary Adder Tree (unchanged)
+// =============================================================================
+module adder_tree #(
+    parameter W = 48,
+    parameter N = 16
+)(
+    input  wire [N*W-1:0]     in_vec,
+    output wire signed [W-1:0] out_sum
+);
+    generate
+        if (N == 0) begin : empty
+            assign out_sum = {W{1'b0}};
+        end else if (N == 1) begin : leaf
+            assign out_sum = in_vec[0 +: W];
+        end else if (N == 2) begin : node
+            assign out_sum = $signed(in_vec[0 +: W]) + $signed(in_vec[W +: W]);
+        end else begin : branch
+            wire signed [W-1:0] sum_left;
+            wire signed [W-1:0] sum_right;
+            localparam LEFT_N  = N / 2;
+            localparam RIGHT_N = N - LEFT_N;
+
+            adder_tree #(.W(W), .N(LEFT_N)) left_tree (
+                .in_vec (in_vec[0 +: LEFT_N*W]),
+                .out_sum(sum_left)
+            );
+            adder_tree #(.W(W), .N(RIGHT_N)) right_tree (
+                .in_vec (in_vec[LEFT_N*W +: RIGHT_N*W]),
+                .out_sum(sum_right)
+            );
+
+            assign out_sum = sum_left + sum_right;
+        end
+    endgenerate
+endmodule
+`default_nettype wire
+
+
+
+`timescale 1ns/1ps
+`default_nettype none
+
+module addr_gen #(
+    parameter DW    = 16,
+    parameter N_MAC = 16
+)(
+    input  wire [11:0] c_out, c_in,
+    input  wire [9:0]  h_out, w_out,
+
+    input  wire [9:0]  cfg_h_in, cfg_w_in,
+    input  wire [11:0] cfg_c_in, cfg_c_out,
+    input  wire [3:0]  cfg_k, cfg_stride, cfg_pad,
+    input  wire        cfg_mode,
+    input  wire [25:0] cfg_weight_base,
+
+    output reg [N_MAC*18-1:0] ifmap_addrs,
+    output reg [N_MAC*26-1:0] weight_addrs,
+    output reg [N_MAC-1:0]    valid_vec
+);
+    // ── Pre-compute intermediate widths ──────────────────────────────────────
+    // hw_in = cfg_h_in * cfg_w_in, max = 64*64 = 4096 → 13-bit, pakai 18-bit
+    wire [17:0] hw_in  = {8'b0, cfg_h_in} * {8'b0, cfg_w_in};
+
+    // c_in * hw_in, max = 511*4096 = 2,093,056 → 21-bit → pakai [25:0]
+    // tapi ifmap_addrs hanya 18-bit per tap, jadi kita batasi dan deteksi overflow
+    // Untuk layer valid: max ifmap_sz = 512*2*2 = 2048 → addr max = 2047 = 11-bit ✓
+    // Paling besar: E1 input 3*64*64=12288, addr max=12287=14-bit ✓
+    // Gunakan 18-bit intermediate untuk ifmap address (MAX_IFMAP_SZ = 2^18)
+    wire [17:0] cin_x_hw = c_in[11:0] * hw_in[13:0];   // max 511*4096=2M, perlu 21-bit
+    // Untuk safety pakai 25-bit intermediate lalu truncate ke 18-bit
+    wire [24:0] cin_x_hw_wide = {13'b0, c_in} * {7'b0, hw_in};
+
+    // ── Weight address intermediates (26-bit) ─────────────────────────────────
+    wire [7:0]  kk         = {4'b0, cfg_k} * {4'b0, cfg_k};   // max 4*4=16
+    wire [25:0] cin_x_kk   = {14'b0, cfg_c_in}  * {18'b0, kk};
+    wire [25:0] cout_x_kk  = {14'b0, cfg_c_out} * {18'b0, kk};
+    wire [25:0] stride_cout = {14'b0, c_out} * cin_x_kk;
+    wire [25:0] step_cin    = {14'b0, c_in}  * {18'b0, kk};
+    wire [25:0] tr_stride_cin = {14'b0, c_in}  * cout_x_kk;
+    wire [25:0] tr_step_cout  = {14'b0, c_out} * {18'b0, kk};
+
+    integer t, dy, dx;
+    integer in_y, in_x, ifmap_y, ifmap_x;
+    integer hw_in_int;   // integer copy untuk arithmetic di always block
+
+    always @(*) begin
+        hw_in_int = cfg_h_in * cfg_w_in;   // integer: no overflow di 32-bit
+
+        for (t = 0; t < N_MAC; t = t + 1) begin
+            if (t < cfg_k * cfg_k) begin
+
+                // ── dy, dx dari flat index t ─────────────────────────────────
+                if (cfg_k == 4)      begin dy = t / 4; dx = t % 4; end
+                else if (cfg_k == 3) begin dy = t / 3; dx = t % 3; end
+                else                 begin dy = 0;     dx = 0;     end
+
+                if (cfg_mode == 0) begin
+                    // ════════════════════════════════════════════════════════
+                    // Conv2d: in_y = h_out*stride - pad + dy
+                    // ════════════════════════════════════════════════════════
+                    in_y = h_out * cfg_stride - cfg_pad + dy;
+                    in_x = w_out * cfg_stride - cfg_pad + dx;
+
+                    if (in_y >= 0 && in_y < cfg_h_in &&
+                        in_x >= 0 && in_x < cfg_w_in) begin
+                        valid_vec[t] = 1'b1;
+                        // ifmap addr = c_in*H_in*W_in + in_y*W_in + in_x
+                        // Semua integer 32-bit, tidak overflow
+                        ifmap_addrs[t*18 +: 18] = c_in * hw_in_int
+                                                  + in_y * cfg_w_in + in_x;
+                    end else begin
+                        valid_vec[t]            = 1'b0;
+                        ifmap_addrs[t*18 +: 18] = 18'd0;
+                    end
+
+                    // weight addr = base + c_out*(C_in*k*k) + c_in*(k*k) + t
+                    weight_addrs[t*26 +: 26] = cfg_weight_base
+                                              + stride_cout
+                                              + step_cin
+                                              + t[25:0];
+
+                end else begin
+                    // ════════════════════════════════════════════════════════
+                    // ConvTranspose2d: in_y = h_out + pad - dy
+                    // ════════════════════════════════════════════════════════
+                    in_y = h_out + cfg_pad - dy;
+                    in_x = w_out + cfg_pad - dx;
+
+                    if (in_y >= 0 &&
+                        (in_y % cfg_stride) == 0 &&
+                        in_x >= 0 &&
+                        (in_x % cfg_stride) == 0) begin
+
+                        ifmap_y = in_y / cfg_stride;
+                        ifmap_x = in_x / cfg_stride;
+
+                        if (ifmap_y < cfg_h_in && ifmap_x < cfg_w_in) begin
+                            valid_vec[t] = 1'b1;
+                            ifmap_addrs[t*18 +: 18] = c_in * hw_in_int
+                                                     + ifmap_y * cfg_w_in
+                                                     + ifmap_x;
+                        end else begin
+                            valid_vec[t]            = 1'b0;
+                            ifmap_addrs[t*18 +: 18] = 18'd0;
+                        end
+                    end else begin
+                        valid_vec[t]            = 1'b0;
+                        ifmap_addrs[t*18 +: 18] = 18'd0;
+                    end
+
+                    // weight addr (ConvTranspose2d)
+                    // PyTorch storage: [C_in, C_out, kH, kW]
+                    // → base + c_in*(C_out*k*k) + c_out*(k*k) + t
+                    weight_addrs[t*26 +: 26] = cfg_weight_base
+                                              + tr_stride_cin
+                                              + tr_step_cout
+                                              + t[25:0];
+                end
+
+            end else begin
+                valid_vec[t]             = 1'b0;
+                ifmap_addrs[t*18 +: 18]  = 18'd0;
+                weight_addrs[t*26 +: 26] = 26'd0;
+            end
+        end
+    end
+
+endmodule
+`default_nettype wire
+
+
+
+// =============================================================================
+// batchnorm2d.v — Synced Channel Version
+// =============================================================================
+`timescale 1ns/1ps
+`default_nettype none
+
+module batchnorm2d #(
+    parameter DW = 16,
+    parameter FRAC_W = 8,
+    parameter C = 512
+)(
+    input wire clk,
+    input wire rst_n,
+    
+    // Write Interface (Weights)
+    input wire wr_en,
+    input wire wr_sel,      // 0: scale, 1: offset
+    input wire [8:0] wr_addr,
+    input wire signed [DW-1:0] wr_data,
+
+    // Data Interface
+    input wire [11:0] c_idx_in,  // [FIX] Kabel channel index langsung dari FSM
+    input wire x_valid,
+    input wire signed [DW-1:0] x_in,
+
+    output reg y_valid,
+    output reg signed [DW-1:0] y_out
+);
+
+    reg signed [DW-1:0] scale_mem [0:C-1];
+    reg signed [DW-1:0] offset_mem [0:C-1];
+
+    always @(posedge clk) begin
+        if (wr_en) begin
+            if (wr_sel == 0) scale_mem[wr_addr] <= wr_data;
+            else             offset_mem[wr_addr] <= wr_data;
+        end
+    end
+
+    // Pipeline 1 Cycle
+    reg signed [DW-1:0] x_in_r;
+    reg x_valid_r;
+    reg signed [DW-1:0] scale_r, offset_r;
+
+    wire signed [31:0] mult_res = $signed(x_in_r) * $signed(scale_r);
+    wire signed [31:0] shifted_res = (mult_res >>> FRAC_W) + $signed({{16{offset_r[DW-1]}}, offset_r});
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            x_valid_r <= 0; y_valid <= 0;
+            y_out <= 0;
+        end else begin
+            x_valid_r <= x_valid;
+            x_in_r    <= x_in;
+            
+            // [FIX] Anti Desync: Selalu baca bumbu sesuai channel index dari luar
+            scale_r   <= scale_mem[c_idx_in];
+            offset_r  <= offset_mem[c_idx_in];
+
+            y_valid <= x_valid_r;
+            if (x_valid_r) begin
+                if (shifted_res > 32767)       y_out <= 16'sd32767;
+                else if (shifted_res < -32768) y_out <= -16'sd32768;
+                else                           y_out <= shifted_res[15:0];
+            end
+        end
+    end
+endmodule
+`default_nettype wire
+
+
+
+
+
+this is train.py
+import os
+import argparse
+from pandas import DataFrame
+from PIL import Image
+import torch
+from torch.autograd import Variable
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+from torchvision.utils import save_image
+
+from models import Generator, Discriminator, ImageDataset, weights_init_normal, save_weights_bin, load_weights_bin
+
+
+# ──────────────────────────────────────────────
+# Argumen CLI
+# ──────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Train Context Encoder GAN (FFHQ / CelebA)")
+parser.add_argument("--data_dir",        type=str,   default="./data/ffhq/thumbnails128x128",
+                    help="Path ke folder gambar FFHQ (.png) atau CelebA (.jpg)")
+parser.add_argument("--n_epochs",        type=int,   default=400)
+parser.add_argument("--batch_size",      type=int,   default=16)
+parser.add_argument("--lr",              type=float, default=0.0002)
+parser.add_argument("--b1",              type=float, default=0.5)
+parser.add_argument("--b2",              type=float, default=0.999)
+parser.add_argument("--n_cpu",           type=int,   default=4)
+parser.add_argument("--img_size",        type=int,   default=64,  help="Ukuran gambar (64x64)")
+parser.add_argument("--mask_size",       type=int,   default=32,  help="Ukuran mask maksimum")
+parser.add_argument("--min_mask_size",   type=int,   default=10,  help="Ukuran mask minimum saat training")
+parser.add_argument("--channels",        type=int,   default=3)
+parser.add_argument("--sample_interval", type=int,   default=100, help="Simpan sample setiap N batch")
+parser.add_argument("--save_interval",   type=int,   default=1,   help="Simpan model setiap N epoch")
+parser.add_argument("--resume",          type=str,   default=None,
+                    help="Path ke checkpoint generator (.bin) untuk melanjutkan training (opsional)")
+opt = parser.parse_args()
+print(opt)
+
+os.makedirs("images",  exist_ok=True)
+os.makedirs("weights", exist_ok=True)
+
+# ──────────────────────────────────────────────
+# Device
+# ──────────────────────────────────────────────
+cuda   = torch.cuda.is_available()
+device = torch.device("cuda" if cuda else "cpu")
+print(f"Device: {device}")
+
+# PatchGAN patch shape untuk mask 32x32
+patch_h = patch_w = opt.mask_size // (2 ** 3)   # = 4
+patch   = (1, patch_h, patch_w)
+
+# ──────────────────────────────────────────────
+# Model
+# ──────────────────────────────────────────────
+generator     = Generator(channels=opt.channels).to(device)
+discriminator = Discriminator(channels=opt.channels).to(device)
+
+generator.apply(weights_init_normal)
+discriminator.apply(weights_init_normal)
+
+if opt.resume:
+    print(f"Melanjutkan training dari: {opt.resume}")
+    load_weights_bin(generator, opt.resume, device)
+
+# ──────────────────────────────────────────────
+# Loss
+# ──────────────────────────────────────────────
+adversarial_loss = torch.nn.MSELoss().to(device)
+pixelwise_loss   = torch.nn.L1Loss().to(device)
+
+# ──────────────────────────────────────────────
+# Optimizers
+# ──────────────────────────────────────────────
+optimizer_G = torch.optim.Adam(generator.parameters(),     lr=opt.lr, betas=(opt.b1, opt.b2))
+optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+
+# ──────────────────────────────────────────────
+# Dataset & Dataloader
+# ──────────────────────────────────────────────
+transforms_ = [
+    transforms.Resize((opt.img_size, opt.img_size), Image.BICUBIC),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+]
+
+train_dataset = ImageDataset(opt.data_dir, transforms_=transforms_,
+                             img_size=opt.img_size, mask_size=opt.mask_size,
+                             min_mask_size=opt.min_mask_size, mode="train")
+val_dataset   = ImageDataset(opt.data_dir, transforms_=transforms_,
+                             img_size=opt.img_size, mask_size=opt.mask_size,
+                             min_mask_size=opt.min_mask_size, mode="val")
+
+dataloader      = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True,
+                             num_workers=opt.n_cpu)
+test_dataloader = DataLoader(val_dataset,   batch_size=12, shuffle=True, num_workers=1)
+
+print(f"Train: {len(train_dataset)} gambar | Val: {len(val_dataset)} gambar")
+
+Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+
+
+# ──────────────────────────────────────────────
+# Fungsi simpan sample visual
+# ──────────────────────────────────────────────
+def save_sample(batches_done):
+    samples, masked_samples, coords = next(iter(test_dataloader))
+    samples        = Variable(samples.type(Tensor))
+    masked_samples = Variable(masked_samples.type(Tensor))
+    y  = coords[0, 0].item()
+    x  = coords[0, 1].item()
+    ms = coords[0, 2].item()
+
+    gen_full       = generator(masked_samples)
+    filled_samples = masked_samples.clone()
+    filled_samples[:, :, y:y+ms, x:x+ms] = gen_full[:, :, y:y+ms, x:x+ms]
+
+    sample = torch.cat((masked_samples.data, filled_samples.data, samples.data), -2)
+    save_image(sample, "images/%d.png" % batches_done, nrow=6, normalize=True)
+    print(f"  -> Sample disimpan: images/{batches_done}.png")
+
+
+# ──────────────────────────────────────────────
+# History
+# ──────────────────────────────────────────────
+loss_values_adv   = []
+loss_values_pixel = []
+loss_values       = []
+real_loss_values  = []
+fake_loss_values  = []
+d_loss_values     = []
+
+# ──────────────────────────────────────────────
+# TRAINING LOOP
+# ──────────────────────────────────────────────
+print(f"\n=== Mulai Training {opt.n_epochs} epoch ===\n")
+
+for epoch in range(opt.n_epochs):
+    for i, (imgs, masked_imgs, coords) in enumerate(dataloader):
+
+        y1s        = coords[:, 0]
+        x1s        = coords[:, 1]
+        mask_sizes = coords[:, 2]
+
+        imgs        = Variable(imgs.type(Tensor))
+        masked_imgs = Variable(masked_imgs.type(Tensor))
+
+        valid = Variable(Tensor(imgs.shape[0], *patch).fill_(1.0), requires_grad=False)
+        fake  = Variable(Tensor(imgs.shape[0], *patch).fill_(0.0), requires_grad=False)
+
+        # ── Generator ──
+        optimizer_G.zero_grad()
+        gen_full = generator(masked_imgs)  # output 64x64 penuh
+
+        # Ekstrak patch tiap sampel, resize ke opt.mask_size untuk Discriminator
+        real_patches = []
+        gen_patches  = []
+        for b in range(imgs.shape[0]):
+            y  = int(y1s[b].item())
+            x  = int(x1s[b].item())
+            ms = int(mask_sizes[b].item())
+
+            real_patch = imgs[b:b+1,     :, y:y+ms, x:x+ms]
+            gen_patch  = gen_full[b:b+1, :, y:y+ms, x:x+ms]
+
+            real_patches.append(torch.nn.functional.interpolate(
+                real_patch, size=(opt.mask_size, opt.mask_size),
+                mode='bilinear', align_corners=False))
+            gen_patches.append(torch.nn.functional.interpolate(
+                gen_patch, size=(opt.mask_size, opt.mask_size),
+                mode='bilinear', align_corners=False))
+
+        real_patches = torch.cat(real_patches, dim=0)
+        gen_patches  = torch.cat(gen_patches,  dim=0)
+
+        # Pixel loss hanya pada area mask
+        mask = torch.zeros_like(imgs)
+        for b in range(imgs.shape[0]):
+            y  = int(y1s[b].item())
+            x  = int(x1s[b].item())
+            ms = int(mask_sizes[b].item())
+            mask[b, :, y:y+ms, x:x+ms] = 1.0
+
+        g_adv   = adversarial_loss(discriminator(gen_patches), valid)
+        g_pixel = pixelwise_loss(gen_full * mask, imgs * mask)
+        g_loss  = 0.001 * g_adv + 0.999 * g_pixel
+        g_loss.backward()
+        optimizer_G.step()
+
+        # ── Discriminator ──
+        optimizer_D.zero_grad()
+        real_loss = adversarial_loss(discriminator(real_patches),         valid)
+        fake_loss = adversarial_loss(discriminator(gen_patches.detach()), fake)
+        d_loss    = 0.5 * (real_loss + fake_loss)
+        d_loss.backward()
+        optimizer_D.step()
+
+        # ── Log setiap 50 batch ──
+        if i % 50 == 0:
+            loss_values_adv.append(g_adv.item())
+            loss_values_pixel.append(g_pixel.item())
+            loss_values.append(g_loss.item())
+            real_loss_values.append(real_loss.item())
+            fake_loss_values.append(fake_loss.item())
+            d_loss_values.append(d_loss.item())
+            print("[Epoch %d/%d] [Batch %d/%d] [D loss: %.4f] [G adv: %.4f, pixel: %.4f]" %
+                  (epoch + 1, opt.n_epochs, i, len(dataloader),
+                   d_loss.item(), g_adv.item(), g_pixel.item()))
+
+        # ── Simpan sample ──
+        batches_done = epoch * len(dataloader) + i
+        if batches_done % opt.sample_interval == 0:
+            save_sample(batches_done)
+
+    # ── Akhir epoch: simpan loss CSV & model ──
+    DataFrame(loss_values_adv,   columns=["g_adv"]).to_csv("g_adv_loss_values.csv",     index=False)
+    DataFrame(loss_values_pixel, columns=["g_pixel"]).to_csv("g_pixel_loss_values.csv", index=False)
+    DataFrame(loss_values,       columns=["g_loss"]).to_csv("g_loss_values.csv",         index=False)
+    DataFrame(real_loss_values,  columns=["real_loss"]).to_csv("real_loss_values.csv",   index=False)
+    DataFrame(fake_loss_values,  columns=["fake_loss"]).to_csv("fake_loss_values.csv",   index=False)
+    DataFrame(d_loss_values,     columns=["d_loss"]).to_csv("d_loss_values.csv",         index=False)
+
+    if (epoch + 1) % opt.save_interval == 0:
+        save_weights_bin(generator,     f"./weights/generator_epoch{epoch+1}.bin")
+        save_weights_bin(discriminator, f"./weights/discriminator_epoch{epoch+1}.bin")
+
+    save_weights_bin(generator,     "./weights/gw_latest.bin")
+    save_weights_bin(discriminator, "./weights/dw_latest.bin")
+    print(f"--> Epoch {epoch+1}/{opt.n_epochs} selesai! Model disimpan di ./weights/")
+
+print("\n=== Training selesai! ===")
+
+
+this is extract_weights
+#!/usr/bin/env python3
+"""
+extract_weights.py
+──────────────────
+Parse generator .bin weight file → hex files siap diload ke RTL Verilog.
+
+Format .bin (dari save_weights_bin):
+  Raw float32, tulis berurutan sesuai model.state_dict().items()
+  Tidak ada header, tidak ada delimiter — pure bytes.
+
+Output per layer:
+  layer_XX_weight.hex   → untuk conv2d_core / convtranspose2d_core
+  layer_XX_bn_scale.hex → untuk batchnorm2d  (precomputed gamma/sqrt(var+eps))
+  layer_XX_bn_offset.hex → untuk batchnorm2d (precomputed beta - mean*scale)
+
+Usage:
+  python3 extract_weights.py gw_latest.bin
+  python3 extract_weights.py generator_epoch662.bin
+"""
+
+import numpy as np
+import struct
+import os
+import sys
+
+# ── Fixed-point config ────────────────────────────────────────────────────────
+DW     = 16
+FRAC_W = 8
+SCALE  = 1 << FRAC_W   # 256
+EPS    = 0.8            # BatchNorm2d eps di kode lo: nn.BatchNorm2d(out_feat, 0.8)
+
+# ── Generator state_dict layout ───────────────────────────────────────────────
+# Diambil dari kode Generator persis, urutan Sequential:
+#   downsample(3,  64,  normalize=False)  → Conv2d, LeakyReLU          (no BN)
+#   downsample(64, 64,  normalize=True)   → Conv2d, BN, LeakyReLU
+#   downsample(64, 128, normalize=True)   → Conv2d, BN, LeakyReLU
+#   downsample(128,256, normalize=True)   → Conv2d, BN, LeakyReLU
+#   downsample(256,512, normalize=True)   → Conv2d, BN, LeakyReLU
+#   Conv2d(512, 4000, 1)                  → bottleneck (no BN)
+#   upsample(4000,512)                    → ConvT, BN, ReLU
+#   upsample(512, 256)                    → ConvT, BN, ReLU
+#   upsample(256, 128)                    → ConvT, BN, ReLU
+#   upsample(128, 64)                     → ConvT, BN, ReLU
+#   Conv2d(64, 3, 3, 1, 1)               → output head (no BN)
+#   Tanh()                                → no params
+#
+# state_dict key order (PyTorch nn.Sequential dengan index):
+#   model.0.weight                    Conv2d E1 weight
+#                                     (no BN karena normalize=False)
+#   model.1.weight, .bias, .running_mean, .running_var, .num_batches_tracked
+#                                     BN E2
+#   model.2.weight                    Conv2d E2
+#   model.3.weight,.bias,.running_mean,.running_var,.num_batches_tracked   BN E2
+#   ...
+#
+# CATATAN: PyTorch Sequential index mengikuti urutan LAYER di list,
+# bukan urutan blok. Kita perlu map index ke layer logic.
+
+LAYOUT = [
+    # (name,        type,      shape,              has_bias)
+    # ── ENCODER ──────────────────────────────────────────────────────────────
+    ("E1_conv",     "conv",    (64,  3,   4, 4),   True),
+    # normalize=False → tidak ada BN di E1
+    ("E2_conv",     "conv",    (64,  64,  4, 4),   True),
+    ("E2_bn",       "bn",      (64,),               None),   # gamma,beta,mean,var,nb
+    ("E3_conv",     "conv",    (128, 64,  4, 4),   True),
+    ("E3_bn",       "bn",      (128,),              None),
+    ("E4_conv",     "conv",    (256, 128, 4, 4),   True),
+    ("E4_bn",       "bn",      (256,),              None),
+    ("E5_conv",     "conv",    (512, 256, 4, 4),   True),
+    ("E5_bn",       "bn",      (512,),              None),
+    # ── BOTTLENECK ────────────────────────────────────────────────────────────
+    ("BOT_conv",    "conv",    (4000,512, 1, 1),   True),
+    # ── DECODER ───────────────────────────────────────────────────────────────
+    ("D1_convt",    "convt",   (4000,512, 4, 4),   True),
+    ("D1_bn",       "bn",      (512,),              None),
+    ("D2_convt",    "convt",   (512, 256, 4, 4),   True),
+    ("D2_bn",       "bn",      (256,),              None),
+    ("D3_convt",    "convt",   (256, 128, 4, 4),   True),
+    ("D3_bn",       "bn",      (128,),              None),
+    ("D4_convt",    "convt",   (128, 64,  4, 4),   True),
+    ("D4_bn",       "bn",      (64,),               None),
+    # ── OUTPUT HEAD ──────────────────────────────────────────────────────────
+    ("OUT_conv",    "conv",    (3,   64,  3, 3),   True),
+    # Tanh: no params
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def to_fp(arr):
+    """float32 → int16 Q7.8, clamp to [-32768, 32767]"""
+    v = np.round(arr.astype(np.float64) * SCALE).astype(np.int64)
+    return np.clip(v, -(1<<(DW-1)), (1<<(DW-1))-1).astype(np.int16)
+
+def write_hex(fname, arr_int16):
+    """Write int16 array as 4-char hex, one per line (2's complement)"""
+    with open(fname, "w") as f:
+        for v in np.array(arr_int16).flatten():
+            f.write(f"{int(v) & 0xFFFF:04x}\n")
+
+def write_hex_40(fname, arr_int32):
+    """Write int32/int64 as 10-char hex (for ACC_W=40)"""
+    with open(fname, "w") as f:
+        for v in np.array(arr_int32).flatten():
+            f.write(f"{int(v) & 0xFFFFFFFFFF:010x}\n")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 extract_weights.py <path/to/generator.bin>")
+        print("\nAvailable files might be:")
+        print("  gw_latest.bin")
+        print("  generator_epoch662.bin")
+        sys.exit(1)
+
+    bin_path = sys.argv[1]
+    print("=" * 60)
+    print(f"  extract_weights.py")
+    print(f"  Input : {bin_path}")
+    print(f"  Format: Q{DW-FRAC_W-1}.{FRAC_W}  SCALE={SCALE}  EPS_BN={EPS}")
+    print("=" * 60)
+
+    # ── Load raw bytes ─────────────────────────────────────────────────────────
+    with open(bin_path, "rb") as f:
+        raw = np.frombuffer(f.read(), dtype=np.float32)
+
+    total_floats = len(raw)
+    print(f"\nFile size  : {os.path.getsize(bin_path) / 1e6:.2f} MB")
+    print(f"Total float: {total_floats:,}")
+
+    # ── Parse sequentially ─────────────────────────────────────────────────────
+    out_dir = "weights_hex"
+    os.makedirs(out_dir, exist_ok=True)
+
+    offset = 0
+    layer_info = []
+
+    print(f"\n{'Layer':<15} {'Type':<6} {'Shape':<22} {'#floats':>8}  {'offset_start':>12}")
+    print("-" * 70)
+
+    for name, ltype, shape, has_bias in LAYOUT:
+
+        if ltype in ("conv", "convt"):
+            # ── weight ────────────────────────────────────────────────────────
+            n_weight = int(np.prod(shape))
+            weight   = raw[offset : offset + n_weight].reshape(shape)
+            offset  += n_weight
+
+            weight_fp = to_fp(weight)
+            fname_w   = f"{out_dir}/{name}_weight.hex"
+            write_hex(fname_w, weight_fp)
+
+            print(f"{name:<15} {'conv':<6} {str(shape):<22} {n_weight:>8,}  loaded")
+
+            # ── bias (conv2d di kode lo default punya bias kecuali disable) ───
+            # PyTorch Conv2d default bias=True, tapi di kode GAN tidak set bias=False
+            # → ada bias. ConvTranspose2d juga ada bias.
+            # has_bias=True berarti ada 1D bias tensor dengan ukuran C_out
+            if has_bias:
+                c_out  = shape[0]
+                bias   = raw[offset : offset + c_out]
+                offset += c_out
+                bias_fp = to_fp(bias)
+                write_hex(f"{out_dir}/{name}_bias.hex", bias_fp)
+
+            layer_info.append((name, ltype, shape))
+
+        elif ltype == "bn":
+            # ── BatchNorm2d params (urutan PyTorch): ──────────────────────────
+            #   weight (gamma), bias (beta), running_mean, running_var, num_batches_tracked
+            c = shape[0]
+
+            gamma   = raw[offset:offset+c]; offset += c
+            beta    = raw[offset:offset+c]; offset += c
+            r_mean  = raw[offset:offset+c]; offset += c
+            r_var   = raw[offset:offset+c]; offset += c
+            nb      = raw[offset:offset+1]; offset += 1   # num_batches_tracked (int64 stored as float? check)
+
+            # ── Precompute fused params ────────────────────────────────────────
+            scale_f  = gamma / np.sqrt(r_var + EPS)
+            offset_f = beta  - r_mean * scale_f
+
+            scale_fp  = to_fp(scale_f)
+            offset_fp = to_fp(offset_f)
+
+            write_hex(f"{out_dir}/{name}_scale.hex",  scale_fp)
+            write_hex(f"{out_dir}/{name}_offset.hex", offset_fp)
+
+            print(f"{name:<15} {'bn':<6} {str(shape):<22} {5*c+1:>8,}  "
+                  f"scale=[{scale_f.min():.3f},{scale_f.max():.3f}]  "
+                  f"offset=[{offset_f.min():.3f},{offset_f.max():.3f}]")
+
+            layer_info.append((name, ltype, shape))
+
+    print("-" * 70)
+    print(f"Total floats parsed : {offset:,} / {total_floats:,}")
+
+    if offset != total_floats:
+        diff = total_floats - offset
+        print(f"\n⚠  WARNING: {diff} floats remaining — cek layout atau ada layer ekstra")
+        print("   Kemungkinan: num_batches_tracked disimpan sebagai int64 (2×float32)")
+        # Try dengan nb sebagai int64 (2 float32 words)
+        print("   Coba jalankan dengan flag --nb64 jika ada mismatch")
+    else:
+        print(f"\n✓  Semua float terbaca persis.")
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    hex_files = sorted(os.listdir(out_dir))
+    print(f"\nOutput dir: {out_dir}/")
+    print(f"Files generated ({len(hex_files)}):")
+    for f in hex_files:
+        fpath = f"{out_dir}/{f}"
+        lines = sum(1 for _ in open(fpath))
+        print(f"  {f:<40}  {lines:>6} entries")
+
+    print("\nCara load ke RTL testbench:")
+    print('  $readmemh("weights_hex/E1_conv_weight.hex", weight_mem);')
+    print('  $readmemh("weights_hex/E2_bn_scale.hex",   scale_mem);')
+    print('  $readmemh("weights_hex/E2_bn_offset.hex",  offset_mem);')
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+    
+this is run_train.sh
+#!/bin/bash
+DATA_DIR="./data/celeba/img_align_celeba"
+N_EPOCHS=400
+BATCH_SIZE=16
+LR=0.0002
+N_CPU=4
+IMG_SIZE=64
+MASK_SIZE=32
+SAMPLE_INTERVAL=100
+SAVE_INTERVAL=1
+RESUME=""           
+echo "============================================"
+echo " Context Encoder GAN — Training"
+echo "============================================"
+echo " Data dir      : $DATA_DIR"
+echo " Epochs        : $N_EPOCHS"
+echo " Batch size    : $BATCH_SIZE"
+echo " Image size    : ${IMG_SIZE}x${IMG_SIZE}"
+echo " Mask size     : ${MASK_SIZE}x${MASK_SIZE}"
+echo " Learning rate : $LR"
+echo "============================================"
+
+if [ ! -d "$DATA_DIR" ]; then
+    echo "[ERROR] Folder dataset tidak ditemukan: $DATA_DIR"
+    echo "        Pastikan sudah download dan ekstrak dataset."
+    exit 1
+fi
+
+IMG_COUNT=$(find "$DATA_DIR" -maxdepth 1 -iname "*.jpg" | wc -l)
+if [ "$IMG_COUNT" -eq 0 ]; then
+    echo "[ERROR] Tidak ada file .jpg di: $DATA_DIR"
+    exit 1
+fi
+echo " Jumlah gambar : $IMG_COUNT"
+echo ""
+
+RESUME_ARG=""
+if [ -n "$RESUME" ]; then
+    RESUME_ARG="--resume $RESUME"
+    echo " Resume dari   : $RESUME"
+fi
+
+MIN_MASK_SIZE=10
+
+# Jalankan training
+python3 train.py \
+    --data_dir        "$DATA_DIR"        \
+    --n_epochs        "$N_EPOCHS"        \
+    --batch_size      "$BATCH_SIZE"      \
+    --lr              "$LR"              \
+    --n_cpu           "$N_CPU"           \
+    --img_size        "$IMG_SIZE"        \
+    --mask_size       "$MASK_SIZE"       \
+    --min_mask_size   "$MIN_MASK_SIZE"
+    --sample_interval "$SAMPLE_INTERVAL" \
+    --save_interval   "$SAVE_INTERVAL"   \
+    $RESUME_ARG
+
+EXIT_CODE=$?
+if [ $EXIT_CODE -eq 0 ]; then
+    echo ""
+    echo "============================================"
+    echo " Training selesai!"
+    echo " Model tersimpan di: ./weights/gw_latest.pth"
+    echo "============================================"
+else
+    echo ""
+    echo "[ERROR] Training gagal dengan exit code: $EXIT_CODE"
+    exit $EXIT_CODE
+fi
+
+this is models.py
+import glob
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+
+# ──────────────────────────────────────────────
+# Dataset
+# ──────────────────────────────────────────────
+class ImageDataset(Dataset):
+    def __init__(self, root, transforms_=None, img_size=64, mask_size=32,
+                 min_mask_size=10, mode="train"):
+        self.transform      = transforms.Compose(transforms_)
+        self.img_size       = img_size
+        self.mask_size      = mask_size
+        self.min_mask_size  = min_mask_size
+        self.mode           = mode
+
+        # Mendukung struktur folder FFHQ (subfolders) maupun flat folder
+        self.files = sorted(
+            glob.glob("%s/**/*.png" % root, recursive=True) +
+            glob.glob("%s/**/*.jpg" % root, recursive=True) +
+            glob.glob("%s/**/*.jpeg" % root, recursive=True) +
+            glob.glob("%s/*.png" % root) +
+            glob.glob("%s/*.jpg" % root) +
+            glob.glob("%s/*.jpeg" % root)
+        )
+        # Menghapus duplikat
+        self.files = sorted(list(dict.fromkeys(self.files)))
+
+        if not self.files:
+            raise FileNotFoundError(f"Tidak ada file gambar ditemukan di: {root}")
+
+        print(f"[Dataset] Mode: {mode} | Ditemukan {len(self.files)} gambar.")
+
+        split_idx  = int(len(self.files) * 0.9)
+        self.files = self.files[:split_idx] if mode == "train" else self.files[split_idx:]
+
+    def apply_random_mask(self, img):
+        mask_size = np.random.randint(self.min_mask_size, self.mask_size + 1)
+        max_pos = self.img_size - mask_size
+        y1 = np.random.randint(0, max_pos)
+        x1 = np.random.randint(0, max_pos)
+
+        masked_img = img.clone()
+        masked_img[:, y1:y1 + mask_size, x1:x1 + mask_size] = 1
+        return masked_img, (y1, x1, mask_size)
+
+    def apply_center_mask(self, img):
+        i = (self.img_size - self.mask_size) // 2
+        masked_img = img.clone()
+        masked_img[:, i:i + self.mask_size, i:i + self.mask_size] = 1
+        return masked_img, (i, i, self.mask_size)
+
+    def __getitem__(self, index):
+        img = Image.open(self.files[index % len(self.files)]).convert("RGB")
+        img = self.transform(img)
+        if self.mode == "train":
+            masked_img, (y1, x1, ms) = self.apply_random_mask(img)
+        else:
+            masked_img, (y1, x1, ms) = self.apply_center_mask(img)
+        return img, masked_img, torch.tensor([y1, x1, ms])
+
+    def __len__(self):
+        return len(self.files)
+
+
+# ──────────────────────────────────────────────
+# Generator Lite (Optimasi PYNQ-Z1)
+# ──────────────────────────────────────────────
+class Generator(nn.Module):
+    def __init__(self, channels=3):
+        super().__init__()
+
+        def downsample(in_feat, out_feat, normalize=True):
+            layers = [nn.Conv2d(in_feat, out_feat, 4, stride=2, padding=1)]
+            if normalize:
+                layers.append(nn.BatchNorm2d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2))
+            return layers
+
+        def upsample(in_feat, out_feat, normalize=True):
+            layers = [nn.ConvTranspose2d(in_feat, out_feat, 4, stride=2, padding=1)]
+            if normalize:
+                layers.append(nn.BatchNorm2d(out_feat, 0.8))
+            layers.append(nn.ReLU())
+            return layers
+
+        # Struktur Arsitektur Lite:
+        # Input: 64x64
+        # Encoder: 64 -> 32 -> 16 -> 8 -> 4 -> 2
+        # Decoder: 2 -> 4 -> 8 -> 16 -> 32 -> 64
+        self.model = nn.Sequential(
+            *downsample(channels, 32, normalize=False), # E1: 64 -> 32
+            *downsample(32, 64),                        # E2: 32 -> 16
+            *downsample(64, 128),                       # E3: 16 -> 8
+            *downsample(128, 256),                      # E4: 8 -> 4
+            *downsample(256, 512),                      # E5: 4 -> 2
+            
+            # Bottleneck: Dikecilkan dari 4000 ke 512
+            nn.Conv2d(512, 512, 1),                     # B1: 2x2
+            
+            *upsample(512, 256),                        # D1: 2 -> 4
+            *upsample(256, 128),                        # D2: 4 -> 8
+            *upsample(128, 64),                         # D3: 8 -> 16
+            *upsample(64, 32),                          # D4: 16 -> 32
+            *upsample(32, 32),                          # D5: 32 -> 64
+            
+            nn.Conv2d(32, channels, 3, 1, 1),           # Output: 64x64
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+# ──────────────────────────────────────────────
+# Discriminator Lite
+# ──────────────────────────────────────────────
+class Discriminator(nn.Module):
+    def __init__(self, channels=3):
+        super().__init__()
+
+        def block(in_f, out_f, stride, normalize):
+            layers = [nn.Conv2d(in_f, out_f, 3, stride, 1)]
+            if normalize:
+                layers.append(nn.InstanceNorm2d(out_f))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        # Channel dikurangi untuk efisiensi VRAM dan BRAM
+        layers, in_f = [], channels
+        for out_f, stride, norm in [(32, 2, False), (64, 2, True), (128, 2, True), (256, 1, True)]:
+            layers.extend(block(in_f, out_f, stride, norm))
+            in_f = out_f
+            
+        layers.append(nn.Conv2d(in_f, 1, 3, 1, 1))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, img):
+        return self.model(img)
+
+
+# ──────────────────────────────────────────────
+# Helper Functions
+# ──────────────────────────────────────────────
+def weights_init_normal(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find("BatchNorm2d") != -1:
+        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        torch.nn.init.constant_(m.bias.data, 0.0)
+
+def save_weights_bin(model, filepath):
+    """Menyimpan bobot model ke format raw binary (.bin) untuk ekstraksi RTL"""
+    with open(filepath, 'wb') as f:
+        for name, param in model.state_dict().items():
+            raw_bytes = param.cpu().numpy().astype(np.float32).tobytes()
+            f.write(raw_bytes)
+
+def load_weights_bin(model, filepath, device):
+    """Memuat bobot dari file raw binary (.bin)"""
+    with open(filepath, 'rb') as f:
+        state_dict = model.state_dict()
+        for name, param in state_dict.items():
+            num_elements = param.numel()
+            raw_bytes    = f.read(num_elements * 4)
+
+            if not raw_bytes:
+                raise EOFError(f"File {filepath} tidak cocok dengan struktur model.")
+
+            arr = np.frombuffer(raw_bytes, dtype=np.float32)
+            param.copy_(torch.from_numpy(arr).view_as(param).to(device))

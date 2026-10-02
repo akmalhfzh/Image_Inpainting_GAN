@@ -1,0 +1,287 @@
+{
+  "gan_model_architecture": {
+    "input_dimensions": "3x64x64",
+    "output_dimensions": "3x64x64",
+    "total_parameters": 5856451,
+    "total_macs": "241.04 MMAC",
+    "total_flops": "482.08 MFLOPs",
+    "layers": [
+      {
+        "layer_name": "E1",
+        "layer_type": "Conv2D",
+        "in_channels": 3,
+        "out_channels": 32,
+        "in_shape": "3x64x64",
+        "out_shape": "32x32x32",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "LeakyReLU(0.2)",
+        "has_batchnorm": false,
+        "param_count": 1568,
+        "mac_count": 1572864
+      },
+      {
+        "layer_name": "E2",
+        "layer_type": "Conv2D",
+        "in_channels": 32,
+        "out_channels": 64,
+        "in_shape": "32x32x32",
+        "out_shape": "64x16x16",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "LeakyReLU(0.2)",
+        "has_batchnorm": true,
+        "param_count": 32832,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "E3",
+        "layer_type": "Conv2D",
+        "in_channels": 64,
+        "out_channels": 128,
+        "in_shape": "64x16x16",
+        "out_shape": "128x8x8",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "LeakyReLU(0.2)",
+        "has_batchnorm": true,
+        "param_count": 131200,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "E4",
+        "layer_type": "Conv2D",
+        "in_channels": 128,
+        "out_channels": 256,
+        "in_shape": "128x8x8",
+        "out_shape": "256x4x4",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "LeakyReLU(0.2)",
+        "has_batchnorm": true,
+        "param_count": 524544,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "E5",
+        "layer_type": "Conv2D",
+        "in_channels": 256,
+        "out_channels": 512,
+        "in_shape": "256x4x4",
+        "out_shape": "512x2x2",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "LeakyReLU(0.2)",
+        "has_batchnorm": true,
+        "param_count": 2097664,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "BOT",
+        "layer_type": "Conv2D",
+        "in_channels": 512,
+        "out_channels": 512,
+        "in_shape": "512x2x2",
+        "out_shape": "512x2x2",
+        "kernel_size": "1x1",
+        "stride": 1,
+        "padding": 0,
+        "activation": "None",
+        "has_batchnorm": false,
+        "param_count": 262656,
+        "mac_count": 1048576
+      },
+      {
+        "layer_name": "D1",
+        "layer_type": "ConvTranspose2D",
+        "in_channels": 512,
+        "out_channels": 256,
+        "in_shape": "512x2x2",
+        "out_shape": "256x4x4",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "ReLU",
+        "has_batchnorm": true,
+        "param_count": 2097408,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "D2",
+        "layer_type": "ConvTranspose2D",
+        "in_channels": 256,
+        "out_channels": 128,
+        "in_shape": "256x4x4",
+        "out_shape": "128x8x8",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "ReLU",
+        "has_batchnorm": true,
+        "param_count": 524416,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "D3",
+        "layer_type": "ConvTranspose2D",
+        "in_channels": 128,
+        "out_channels": 64,
+        "in_shape": "128x8x8",
+        "out_shape": "64x16x16",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "ReLU",
+        "has_batchnorm": true,
+        "param_count": 131136,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "D4",
+        "layer_type": "ConvTranspose2D",
+        "in_channels": 64,
+        "out_channels": 32,
+        "in_shape": "64x16x16",
+        "out_shape": "32x32x32",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "ReLU",
+        "has_batchnorm": true,
+        "param_count": 32800,
+        "mac_count": 8388608
+      },
+      {
+        "layer_name": "D5",
+        "layer_type": "ConvTranspose2D",
+        "in_channels": 32,
+        "out_channels": 32,
+        "in_shape": "32x32x32",
+        "out_shape": "32x64x64",
+        "kernel_size": "4x4",
+        "stride": 2,
+        "padding": 1,
+        "activation": "ReLU",
+        "has_batchnorm": true,
+        "param_count": 16416,
+        "mac_count": 16777216
+      },
+      {
+        "layer_name": "OUT",
+        "layer_type": "Conv2D",
+        "in_channels": 32,
+        "out_channels": 3,
+        "in_shape": "32x64x64",
+        "out_shape": "3x64x64",
+        "kernel_size": "3x3",
+        "stride": 1,
+        "padding": 1,
+        "activation": "Tanh",
+        "has_batchnorm": false,
+        "param_count": 867,
+        "mac_count": 3538944
+      }
+    ],
+    "quantization_and_fixed_point": {
+      "data_type": "INT16",
+      "fractional_bits": 8,
+      "format_notation": "Q8.8 signed",
+      "input_quantization_formula": "round(x * 256.0)",
+      "weight_quantization_details": "Per-tensor scale, BN folded into weights",
+      "bias_quantization_details": "16-bit (Q8.8), BN offset folded into bias",
+      "accumulator_bit_width": 48,
+      "truncation_and_rounding": "Sign-extended 32-bit product to 48-bit accumulator width",
+      "saturation_logic": "Clamp between -32768 and 32767"
+    }
+  },
+  "fpga_hardware_architecture": {
+    "target_device": {
+      "board": "PYNQ-Z1",
+      "fpga_part": "XC7Z020-1CLG400C",
+      "target_clock_frequency_mhz": 60,
+      "clock_period_ns": 16.667
+    },
+    "system_interfaces": {
+      "control_interface": "AXI4-Lite via Zynq PS (gan_axi_wrapper)",
+      "dma_data_interface": "AXI4 Master via S_AXI_HP0 (m_axi)",
+      "axi_data_width_bits": 32,
+      "burst_length": 256,
+      "cma_memory_allocation": {
+        "image_buffer": "3x64x64 input image stored at 0x4000000",
+        "fmap_ping_pong_buffers": "0x5000000 (fmap_a) and 0x6000000 (fmap_b)",
+        "weight_buffer": "Weights and folded BN stored at 0x0000000",
+        "output_buffer": "3x64x64 output generated image stored at 0x7000000"
+      }
+    },
+    "rtl_modules_breakdown": [
+      {
+        "module_name": "generator_top",
+        "description": "Top-level module of the Generator. Integrates AXI interfaces and computational blocks.",
+        "parallelism_mac_units": 16,
+        "internal_buffers": "Internal bias memory mapping up to 2016 words for layer biases",
+        "fsm_states": [
+          "ST_IDLE",
+          "ST_CONV_START",
+          "ST_CONV_WAIT",
+          "ST_NEXT_LAYER",
+          "ST_DONE"
+        ]
+      },
+      {
+        "module_name": "gan_axi_wrapper",
+        "description": "Wraps generator_top with AXI4-Lite for PS control (registers) and AXI4 Master for PS DDR access.",
+        "parallelism_mac_units": 0,
+        "internal_buffers": "Registers (slv_reg0 to slv_reg8)",
+        "fsm_states": []
+      },
+      {
+        "module_name": "mac_array",
+        "description": "K*K Parallel MAC Array with 2-stage pipeline (multiplication and adder tree).",
+        "parallelism_mac_units": 16,
+        "internal_buffers": "Pipeline registers for products and sum_out",
+        "fsm_states": []
+      },
+      {
+        "module_name": "conv_unified",
+        "description": "Core computational engine unifying Conv2D and ConvTranspose2D operations.",
+        "parallelism_mac_units": 16,
+        "internal_buffers": "Registers for configurations (padding, mode, act)",
+        "fsm_states": []
+      },
+      {
+        "module_name": "addr_gen",
+        "description": "Generates DDR addresses for fetching weights/feature maps and writing outputs.",
+        "parallelism_mac_units": 0,
+        "internal_buffers": "Counters for beats, rows, cols",
+        "fsm_states": []
+      }
+    ],
+    "execution_flow": {
+      "layer_sequencing": "FSM sequences through layer 0 to 11 (E1 to OUT). Triggers conv_unified for each layer.",
+      "weight_loading_strategy": "DDR streaming via AXI4 Master Burst based on current channel.",
+      "feature_map_ping_pong_mechanism": "Alternates reading/writing between 0x5000000 (fmap_a) and 0x6000000 (fmap_b) per layer, mapped via ping_pong flag."
+    },
+    "synthesis_and_implementation_results": {
+      "lut_used": 7393,
+      "lut_total": 53200,
+      "lut_percent": 13.9,
+      "ff_used": 3244,
+      "ff_total": 106400,
+      "ff_percent": 3.05,
+      "dsp_used": 50,
+      "dsp_total": 220,
+      "dsp_percent": 22.73,
+      "bram_18k_used": 16,
+      "bram_18k_total": 280,
+      "bram_18k_percent": 5.71,
+      "timing_status": "Violated",
+      "wns_ns": -8.452,
+      "tns_ns": -3914.616
+    }
+  }
+}
