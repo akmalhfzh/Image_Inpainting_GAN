@@ -1,0 +1,85 @@
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <vector>
+#include "Vgenerator_top.h"
+#include "verilated.h"
+
+struct WeightFile { const char* fname; int layer; int type; };
+
+void load_hex_to_mem(Vgenerator_top* top, const char* filename, int layer, int type) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "  [WARN] Missing: " << filename << std::endl;
+        return;
+    }
+    std::string line; uint32_t addr = 0;
+    while (std::getline(file, line)) {
+        top->wr_layer = layer; top->wr_type = type;
+        top->wr_addr  = addr++;
+        top->wr_data  = std::stoul(line, nullptr, 16);
+        top->wr_en    = 1;
+        top->clk = 0; top->eval(); top->clk = 1; top->eval();
+    }
+    top->wr_en = 0;
+    top->clk = 0; top->eval(); top->clk = 1; top->eval(); // Ekstra clock untuk pipeline
+}
+
+int main(int argc, char** argv) {
+    Verilated::commandArgs(argc, argv);
+    Vgenerator_top* top = new Vgenerator_top;
+
+    top->rst_n = 0;
+    for (int i = 0; i < 10; i++) { top->clk = !top->clk; top->eval(); }
+    top->rst_n = 1;
+
+    std::cout << "[Verilator] Loading Input Image..." << std::endl;
+    std::ifstream img_file("inputs/img.hex");
+    if (img_file.is_open()) {
+        std::string line; uint32_t addr = 0;
+        while (std::getline(img_file, line)) {
+            top->img_wr_addr = addr++; top->img_wr_en = 1;
+            top->img_wr_data = std::stoul(line, nullptr, 16);
+            top->clk = 0; top->eval(); top->clk = 1; top->eval();
+        }
+        top->img_wr_en = 0;
+        std::cout << "  -> Loaded " << addr << " pixels to img_buf." << std::endl;
+    } else {
+        std::cerr << "  [ERROR] GAGAL BACA inputs/img.hex!" << std::endl;
+    }
+
+    std::cout << "[Verilator] Loading All Weights & Biases..." << std::endl;
+    std::vector<WeightFile> w_list = {
+        // ENCODER
+        {"weights_hex/E1_conv_weight.hex", 0, 0}, {"weights_hex/E1_conv_bias.hex", 0, 1},
+        {"weights_hex/E2_conv_weight.hex", 1, 0}, {"weights_hex/E2_conv_bias.hex", 1, 1}, {"weights_hex/E2_bn_scale.hex", 1, 1}, {"weights_hex/E2_bn_offset.hex", 1, 2},
+        {"weights_hex/E3_conv_weight.hex", 2, 0}, {"weights_hex/E3_conv_bias.hex", 2, 1}, {"weights_hex/E3_bn_scale.hex", 2, 1}, {"weights_hex/E3_bn_offset.hex", 2, 2},
+        {"weights_hex/E4_conv_weight.hex", 3, 0}, {"weights_hex/E4_conv_bias.hex", 3, 1}, {"weights_hex/E4_bn_scale.hex", 3, 1}, {"weights_hex/E4_bn_offset.hex", 3, 2},
+        {"weights_hex/E5_conv_weight.hex", 4, 0}, {"weights_hex/E5_conv_bias.hex", 4, 1}, {"weights_hex/E5_bn_scale.hex", 4, 1}, {"weights_hex/E5_bn_offset.hex", 4, 2},
+        // BOTTLENECK
+        {"weights_hex/BOT_conv_weight.hex", 5, 0},{"weights_hex/BOT_conv_bias.hex", 5, 1},
+        // DECODER
+        {"weights_hex/D1_convt_weight.hex", 6, 0}, {"weights_hex/D1_convt_bias.hex", 6, 1}, {"weights_hex/D1_bn_scale.hex", 6, 1}, {"weights_hex/D1_bn_offset.hex", 6, 2},
+        {"weights_hex/D2_convt_weight.hex", 7, 0}, {"weights_hex/D2_convt_bias.hex", 7, 1}, {"weights_hex/D2_bn_scale.hex", 7, 1}, {"weights_hex/D2_bn_offset.hex", 7, 2},
+        {"weights_hex/D3_convt_weight.hex", 8, 0}, {"weights_hex/D3_convt_bias.hex", 8, 1}, {"weights_hex/D3_bn_scale.hex", 8, 1}, {"weights_hex/D3_bn_offset.hex", 8, 2},
+        {"weights_hex/D4_convt_weight.hex", 9, 0}, {"weights_hex/D4_convt_bias.hex", 9, 1}, {"weights_hex/D4_bn_scale.hex", 9, 1}, {"weights_hex/D4_bn_offset.hex", 9, 2},
+        {"weights_hex/D5_convt_weight.hex",10, 0}, {"weights_hex/D5_convt_bias.hex", 10, 1},{"weights_hex/D5_bn_scale.hex", 10, 1},{"weights_hex/D5_bn_offset.hex", 10, 2},
+        // OUT
+        {"weights_hex/OUT_conv_weight.hex", 11, 0},{"weights_hex/OUT_conv_bias.hex", 11, 1}
+    };
+
+    for (const auto& w : w_list) load_hex_to_mem(top, w.fname, w.layer, w.type);
+
+    std::cout << "[Verilator] Starting Inference..." << std::endl;
+    top->start = 1;
+    uint64_t main_time = 0;
+    
+    while (!top->done && main_time < 50000000) {
+        if (main_time == 2) top->start = 0; 
+        top->clk = !top->clk; top->eval();
+        main_time++;
+    }
+
+    top->final(); delete top;
+    return 0;
+}
