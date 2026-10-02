@@ -2,7 +2,6 @@
 Full-stack hardware accelerator for Context Encoder GAN (Generative Adversarial Network). End-to-end implementation from PyTorch model training to custom Verilog RTL deployment (Conv, MAC, BatchNorm) on Xilinx Zynq/PYNQ FPGA.
 
 ![Hardware Architecture](Results_and_Figures/gan_overview.png)
-![Hardware Architecture](Results_and_Figures/output_GAN.png)
 
 The project covers the complete pipeline: from training the neural network model using PyTorch, converting the trained weights, designing the custom RTL accelerator in Verilog, all the way to deploying the bitstream on the FPGA using Python/PYNQ.
 
@@ -31,6 +30,7 @@ The project is organized into the following directories:
 * 📁 **`Documentation/` & `Results_and_Figures/`**
   * Project documentation, architecture diagrams, and generated output images from the FPGA.
 
+
 ## 🚀 Getting Started
 
 ### 1. Hardware Simulation & Build
@@ -50,6 +50,7 @@ vivado -mode batch -source build_bitstream.tcl  # Generate Bitstream
 ```bash
 python3 pynq_runner.py
 ```
+![Hardware Architecture](Results_and_Figures/output_GAN.png)
 
 ## 🛠️ Technology Stack
 * Hardware Definition: Verilog (RTL)
