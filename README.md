@@ -1,7 +1,7 @@
 # Image Inpainting using Context Encoder GAN on FPGA
 Full-stack hardware accelerator for Context Encoder GAN (Generative Adversarial Network). End-to-end implementation from PyTorch model training to custom Verilog RTL deployment (Conv, MAC, BatchNorm) on Xilinx Zynq/PYNQ FPGA.
 
-![Hardware Architecture](Results_and_Figures/fig2_fpga_gan_hardware_architecture.png)
+![Hardware Architecture](Results_and_Figures/output_GAN.png)
 
 The project covers the complete pipeline: from training the neural network model using PyTorch, converting the trained weights, designing the custom RTL accelerator in Verilog, all the way to deploying the bitstream on the FPGA using Python/PYNQ.
 
