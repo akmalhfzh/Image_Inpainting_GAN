@@ -1,0 +1,108 @@
+=============================================================================
+DETAILED HARDWARE DATAPATH DIAGRAM (DOWN TO COMPUTATION UNIT LEVEL)
+=============================================================================
+
+[TOP LEVEL: FPGA SYSTEM]
+-----------------------------------------------------------------------------
+(ZYNQ PS ARM) <--(AXI4 Master/Slave)--> (GAN_AXI_WRAPPER) <--(AXI4 Master)--> (DDR MEMORY)
+
+Inside GAN_AXI_WRAPPER:
+  -> (AXI_LITE_SLAVE) --> (REGISTER_BANK)
+  -> (GENERATOR_TOP)
+
+
+[LEVEL 2: GENERATOR_TOP]
+-----------------------------------------------------------------------------
+(LAYER_FSM)         : Control state machine
+(PING_PONG_MUX)     : 32-bit Multiplexers for DDR Base Addresses
+(CONFIG_LUT)        : Hardcoded lookup table for Layer Parameters
+(BIAS_MEM)          : Local BRAM for Bias values
+(CONV_UNIFIED)      : The Core Engine (Detailed below)
+
+
+=============================================================================
+[LEVEL 3: CONV_UNIFIED - LOW-LEVEL DATAPATH]
+=============================================================================
+
+1. ADDRESS GENERATOR (addr_gen.v) -> Generates 16 parallel addresses
+-----------------------------------------------------------------------------
+For each of the 16 kernel taps (m = 0 to 15):
+  [MULTIPLIER]   base_y = h_out * stride
+  [SUBTRACTOR]   base_y_pad = base_y - pad
+  [ADDER]        in_y = base_y_pad + dy (kernel row offset)
+  [MULTIPLIER]   base_x = w_out * stride
+  [SUBTRACTOR]   base_x_pad = base_x - pad
+  [ADDER]        in_x = base_x_pad + dx (kernel col offset)
+  
+  [COMPARATOR 1] is_y_valid = (in_y >= 0) AND (in_y < h_in)
+  [COMPARATOR 2] is_x_valid = (in_x >= 0) AND (in_x < w_in)
+  [AND GATE]     valid_vec[m] = is_y_valid AND is_x_valid
+  
+  [MULTIPLIER]   y_offset = in_y * w_in
+  [ADDER]        ifmap_addrs[m] = y_offset + in_x
+
+2. DATA FETCH & CACHE
+-----------------------------------------------------------------------------
+(WEIGHT_CACHE) : 16 banks of BRAM. Outputs weight_tile[0:15]
+(IFMAP_TILE)   : 16x 16-bit Registers. Outputs ifmap_tile[0:15]
+
+3. MAC ARRAY (mac_array.v) -> The Compute Core
+-----------------------------------------------------------------------------
+[MULTIPLIER STAGE] (16 Parallel Units)
+For each tap (m = 0 to 15):
+  [MULTIPLEXER]  ival = valid_vec[m] ? ifmap_tile[m] : 16'd0  (Zero-pad padding)
+  [MULTIPLIER]   prod[m] = weight_tile[m] * ival  (16-bit x 16-bit = 32-bit signed)
+  [SIGN_EXTEND]  prod_sx[m] = sign extend to 48-bit
+  [REGISTER]     prod_reg[m] (Pipeline Stage 1)
+
+[ADDER TREE STAGE] (adder_tree.v - 48-bit signed Adders)
+Level 1:
+  [ADDER] sum_L1_0 = prod_reg[0] + prod_reg[1]
+  [ADDER] sum_L1_1 = prod_reg[2] + prod_reg[3]
+  ... (8 Adders total)
+Level 2:
+  [ADDER] sum_L2_0 = sum_L1_0 + sum_L1_1
+  ... (4 Adders total)
+Level 3:
+  [ADDER] sum_L3_0 = sum_L2_0 + sum_L2_1
+  [ADDER] sum_L3_1 = sum_L2_2 + sum_L2_3
+Level 4:
+  [ADDER] row_sum = sum_L3_0 + sum_L3_1
+  [REGISTER] sum_out_reg (Pipeline Stage 2)
+
+4. ACCUMULATOR & REQUANTIZATION
+-----------------------------------------------------------------------------
+[MULTIPLEXER]  bias_or_acc = is_first_channel ? bias_val : acc_reg
+[ADDER]        acc_next = bias_or_acc + row_sum
+[REGISTER]     acc_reg = latches acc_next
+
+[ADDER]        acc_rounded = acc_reg + 0.5_ULP (Rounding)
+[BIT-SHIFT]    acc_shifted = acc_rounded >>> FRAC_W (Truncation)
+[COMPARATOR 1] sat_pos = acc_shifted > 32767
+[COMPARATOR 2] sat_neg = acc_shifted < -32768
+[MULTIPLEXER]  acc_trunc = sat_pos ? MAX : sat_neg ? MIN : acc_shifted (Saturation)
+
+5. ACTIVATION FUNCTIONS (3 Parallel Hardware Blocks)
+-----------------------------------------------------------------------------
+A. LEAKY RELU
+  [COMPARATOR] is_pos = acc_trunc >= 0
+  [MULTIPLIER] neg_val_mult = acc_trunc * 51
+  [BIT-SHIFT]  neg_val = neg_val_mult >>> 8
+  [MULTIPLEXER] lrelu_out = is_pos ? acc_trunc : neg_val
+
+B. RELU
+  [COMPARATOR] is_pos = acc_trunc >= 0
+  [MULTIPLEXER] relu_out = is_pos ? acc_trunc : 0
+
+C. TANH
+  [SUBTRACTOR] abs_x = (acc_trunc < 0) ? -acc_trunc : acc_trunc (Absolute value)
+  [COMPARATOR] is_sat = abs_x >= 4.0
+  [BRAM LUT]   base_val = lut[abs_x_idx]
+  [SUBTRACTOR] diff = abs_x - idx_floor
+  [MULTIPLIER] interp = diff * slope
+  [ADDER]      tanh_mag = base_val + interp
+  [SUBTRACTOR] tanh_out = (acc_trunc < 0) ? -tanh_mag : tanh_mag (Re-apply sign)
+
+6. OUTPUT MUX
+-----------------------------------------------------------------------------
+[MULTIPLEXER 4x1] final_pixel = selects between (lrelu_out, relu_out, tanh_out, acc_trunc) based on cur_act flag.

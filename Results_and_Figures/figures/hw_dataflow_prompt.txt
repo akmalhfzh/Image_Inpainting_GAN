@@ -1,0 +1,95 @@
+===========================================================
+SYSTEM LEVEL DATAFLOW
+===========================================================
+ZYNQ_PS --(m_axi_lite)--> AXI_INTERCONNECT --(s_axi_lite)--> GAN_AXI_WRAPPER (FPGA_PL)
+ZYNQ_PS --(s_axi_hp0)--> AXI_INTERCONNECT --(DDR R/W)--> DDR_MEMORY
+GAN_AXI_WRAPPER (FPGA_PL) --(m_axi)--> AXI_INTERCONNECT --(DDR R/W)--> DDR_MEMORY
+
+===========================================================
+INSIDE FPGA_PL (gan_axi_wrapper)
+===========================================================
+AXI_INTERCONNECT --(s_axi_awaddr, s_axi_wdata, etc)--> AXI_LITE_SLAVE --(register read/write)--> REG_BANK
+
+REG_BANK --(start_pulse)--> LAYER_FSM (inside generator_top)
+REG_BANK --(reg_img_base, reg_fmap_a_base, reg_fmap_b_base, reg_out_base)--> PING_PONG_MUX (inside generator_top)
+REG_BANK --(bias_wr_en, wr_layer, wr_type, wr_addr, wr_data)--> BIAS_MEM (inside generator_top)
+
+CONV_UNIFIED (inside generator_top) --(m_axi_awaddr, m_axi_wdata, m_axi_araddr, m_axi_rdata)--> AXI_INTERCONNECT
+
+===========================================================
+INSIDE generator_top
+===========================================================
+LAYER_FSM --(layer_idx[3:0])--> CONFIG_LUT
+LAYER_FSM --(layer_idx[3:0], ping_pong)--> PING_PONG_MUX
+LAYER_FSM --(conv_start_r)--> CONV_UNIFIED
+
+CONFIG_LUT --(cfg_h, cfg_w, cfg_c_in, cfg_c_out, cfg_k, cfg_stride, cfg_pad, cur_act)--> CONV_UNIFIED
+PING_PONG_MUX --(cur_ifmap_base, cur_ofmap_base)--> CONV_UNIFIED
+BIAS_MEM --(bias_val[15:0])--> CONV_UNIFIED
+
+CONV_UNIFIED --(current_c_out[11:0])--> BIAS_MEM (feedback for bias read address)
+CONV_UNIFIED --(conv_done_w)--> LAYER_FSM (signal to proceed to next layer)
+
+===========================================================
+INSIDE conv_unified (Core Compute Engine)
+===========================================================
+// 1. Control & Address Generation
+CONFIG_LUT --(cfg_*)--> ADDR_GEN
+AXI4_MASTER_FSM --(c_out_cnt, effective_c_in, h_cnt, w_cnt)--> ADDR_GEN
+ADDR_GEN --(weight_addrs_w, ifmap_addrs_w, valid_vec_w)--> ADDRGEN_PIPE_REG --(weight_addrs_r, ifmap_addrs_r)--> BURST_CALC
+BURST_CALC --(w_cur_addr_r, w_burst_beats_r, i_cur_addr_r, i_burst_beats_r)--> AXI4_MASTER_FSM
+
+// 2. Data Fetch from DDR
+DDR_MEMORY --(m_axi_rdata via AXI4_MASTER_FSM)--> WEIGHT_CACHE (pre-filled per output channel)
+DDR_MEMORY --(m_axi_rdata via AXI4_MASTER_FSM)--> IFMAP_TILE (fetched per kernel row)
+
+// 3. Data Packing
+WEIGHT_CACHE --(weight_tile[0:15])--> VEC_PACK
+IFMAP_TILE --(ifmap_tile[0:15])--> VEC_PACK
+
+// 4. MAC Operations (mac_array)
+VEC_PACK --(weight_vec[255:0], ifmap_vec[255:0])--> MAC_ARRAY
+ADDR_GEN --(valid_vec_w[15:0])--> MAC_ARRAY (zero-pad invalid taps)
+AXI4_MASTER_FSM --(mac_in_valid)--> MAC_ARRAY
+
+// Inside mac_array:
+// VEC_PACK --(weight_vec, ifmap_vec)--> MUL_ARRAY --(prod[16x32b])--> PIPELINE_REGS --(prod_reg[16x48b])--> ADDER_TREE --(tree_out[47:0])--> row_sum
+
+// 5. Accumulation & Bias
+MAC_ARRAY --(row_sum[47:0], mac_out_valid)--> ACC_BIAS
+BIAS_MEM --(bias_val[15:0])--> ACC_BIAS
+
+// 6. Fixed Point Formatting & Activation
+ACC_BIAS --(acc_reg[47:0])--> REQUANT_SAT (round, shift, saturate to INT16)
+
+REQUANT_SAT --(acc_trunc[15:0])--> LEAKY_RELU
+REQUANT_SAT --(acc_trunc[15:0])--> RELU
+REQUANT_SAT --(acc_trunc[15:0])--> TANH_ACT
+REQUANT_SAT --(acc_trunc[15:0])--> ACT_MUX (direct bypass path for cur_act=3)
+
+LEAKY_RELU --(lrelu_out[15:0])--> ACT_MUX
+RELU --(relu_out[15:0])--> ACT_MUX
+TANH_ACT --(tanh_out_w[15:0])--> ACT_MUX
+CONFIG_LUT --(cur_act[1:0])--> ACT_MUX (selects which activation to use)
+
+// 7. Writeback to DDR
+ACT_MUX --(final_pixel[15:0])--> OFMAP_ADDR_CALC
+AXI4_MASTER_FSM --(c_out_cnt, h_cnt, w_cnt)--> OFMAP_ADDR_CALC
+PING_PONG_MUX --(cur_ofmap_base)--> OFMAP_ADDR_CALC
+
+OFMAP_ADDR_CALC --(ofmap_byte_addr[31:0])--> AXI4_MASTER_FSM
+AXI4_MASTER_FSM --(m_axi_wdata[31:0], m_axi_awaddr[31:0])--> DDR_MEMORY (via AXI4-Master 1-beat write)
+
+===========================================================
+DDR MEMORY PING-PONG FLOW (Cross-Layer)
+===========================================================
+// Layer 0 (Input)
+DDR_MEMORY (IMG_BUF) --(m_axi_rdata)--> CONV_UNIFIED --(m_axi_wdata)--> DDR_MEMORY (FMAP_B)
+
+// Layer 1 to 10 (Hidden Layers - Alternating)
+DDR_MEMORY (FMAP_B) --(m_axi_rdata)--> CONV_UNIFIED --(m_axi_wdata)--> DDR_MEMORY (FMAP_A)
+DDR_MEMORY (FMAP_A) --(m_axi_rdata)--> CONV_UNIFIED --(m_axi_wdata)--> DDR_MEMORY (FMAP_B)
+// ... continues toggling ...
+
+// Layer 11 (Output)
+DDR_MEMORY (FMAP_B) --(m_axi_rdata)--> CONV_UNIFIED --(m_axi_wdata)--> DDR_MEMORY (OUT_BUF)
